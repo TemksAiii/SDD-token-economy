@@ -49,3 +49,60 @@ test('AST-LOD1 skeleton reduces Python source tokens while preserving class/def 
   assert.ok(view.lodTokens < view.rawTokens);
   assert.ok(view.reductionPct > 30);
 });
+
+test('AST-LOD1 skeleton preserves TypeScript class methods and interface properties while folding bodies', () => {
+  const tsCode = `export interface IdempotencyRecord<T> {
+  payloadHash: string;
+  value: T;
+  expiresAt: number;
+}
+
+export class IdempotencyGuard {
+  private readonly store = new Map<string, IdempotencyRecord<unknown>>();
+  constructor(private readonly ttlMs = 60_000) {}
+
+  // @spec:REQ-01
+  async execute<T>(key: string, payloadHash: string, handler: () => Promise<T> | T, nowMs = Date.now()): Promise<T> {
+    const existing = this.store.get(key);
+    if (existing && existing.expiresAt > nowMs) {
+      return existing.value as T;
+    }
+    const result = await handler();
+    this.store.set(key, { payloadHash, value: result, expiresAt: nowMs + this.ttlMs });
+    return result;
+  }
+}`;
+  const skeleton = extractAstSkeleton(tsCode, 'typescript', 'idempotencyGuard.ts');
+  assert.match(skeleton, /export interface IdempotencyRecord<T>/);
+  assert.match(skeleton, /payloadHash: string;/);
+  assert.match(skeleton, /export class IdempotencyGuard/);
+  assert.match(skeleton, /async execute<T>\(/);
+  assert.ok(!skeleton.includes('this.store.set'));
+  const view = renderAstLodView('idempotencyGuard.ts', tsCode, 'typescript', 'LOD1');
+  assert.ok(view.lodTokens < view.rawTokens);
+
+  const multiLineClass = `export class TokenBucketRateLimiter {
+  constructor(
+    private readonly capacity = 30,
+    private readonly refillPerSec = 2
+  ) {}
+
+  resolveKey(apiKey?: string, ip?: string): { key: string; limit: number } {
+    if (apiKey) return { key: apiKey, limit: this.capacity };
+    return { key: ip || '127.0.0.1', limit: 20 };
+  }
+
+  consume(
+    path: string,
+    apiKey?: string
+  ): { status: number } {
+    const resolved = this.resolveKey(apiKey);
+    return { status: path === '/healthz' ? 200 : resolved.limit > 0 ? 200 : 429 };
+  }
+}`;
+  const multiSkeleton = extractAstSkeleton(multiLineClass, 'typescript', 'rateLimiter.ts');
+  assert.match(multiSkeleton, /constructor\(/);
+  assert.match(multiSkeleton, /resolveKey\(/);
+  assert.match(multiSkeleton, /consume\(/);
+  assert.ok(!multiSkeleton.includes('this.resolveKey(apiKey)'));
+});

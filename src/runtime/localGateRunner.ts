@@ -1,7 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { runPreReviewGate, PreReviewGateResult } from '../engine/preReviewGate';
-import { compressTestLog, CompressedOutputResult } from '../engine/outputCompressor';
+import {
+  analyzeTestRunOutput,
+  compressTestLog,
+  CompressedOutputResult,
+} from '../engine/outputCompressor';
 import { resolveConfinedPath } from './pathGuard';
 import { collectRepoFiles, detectRepoOnDisk, readOpenSpecBundleFromDisk } from './repoFs';
 import { runSafeCommand, splitCommandArgs } from './execUtils';
@@ -60,7 +64,10 @@ export async function runLocalPreReviewGate(
     signal: options.signal,
   });
 
-  const compressedTestLog = compressTestLog(testRes.combined, info.testRunnerKind);
+  const testAnalysis = analyzeTestRunOutput(testRes.combined, testRes.exitCode);
+  const compressedTestLog = compressTestLog(testRes.combined, info.testRunnerKind, {
+    exitCode: testRes.exitCode,
+  });
 
   const lintParts = splitCommandArgs(info.lintCommand);
   const lintRes = await runSafeCommand(lintParts.bin, lintParts.args, absRepo, {
@@ -79,9 +86,10 @@ export async function runLocalPreReviewGate(
   const gate = runPreReviewGate({
     bundle,
     files,
-    testsPassing: testRes.exitCode === 0,
-    failingTestSnippet: testRes.exitCode === 0 ? undefined : compressedTestLog.compressed,
+    testsPassing: testAnalysis.passed,
+    failingTestSnippet: testAnalysis.passed ? undefined : compressedTestLog.compressed,
     lintErrors,
+    verifySubstance: true,
   });
 
   return {

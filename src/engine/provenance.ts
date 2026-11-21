@@ -7,6 +7,8 @@ export type DataProvenance =
 
 export type SddStage = 'spec_prep' | 'apply' | 'review' | 'verify';
 
+export type IsolationMode = 'git_worktree' | 'snapshot_copy';
+
 export interface RunManifest {
   runId: string;
   createdAt: string;
@@ -14,6 +16,10 @@ export interface RunManifest {
   repoName: string;
   changeId: string;
   baseCommit: string;
+  isolationMode?: IsolationMode;
+  snapshotHash?: string;
+  gitRoot?: string | null;
+  repoSubpath?: string;
   provider: string;
   model: string;
   sameModelEnforced: true;

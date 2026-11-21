@@ -9,13 +9,24 @@ export interface JuryDeliverablesBundle {
   agentsMdSnippet: string;
 }
 
+function formatSavingsPct(val: number | null): string {
+  if (val === null) return 'n/a';
+  if (val > 0) return `−${val}%`;
+  if (val < 0) return `+${Math.abs(val)}%`;
+  return '0%';
+}
+
 export function generateJuryDeliverables(report: AbRunReport): JuryDeliverablesBundle {
   const { manifest, baseline, optimized, savings, provenance, limitations } = report;
+  const isoLabel =
+    manifest.isolationMode === 'snapshot_copy'
+      ? 'snapshot_copy (идентичные копии снимка)'
+      : 'git worktree';
   const provBadge =
     provenance === 'measured'
       ? manifest.provider === 'ollama'
-        ? 'MEASURED (Локальный инференс Ollama + git worktree + реальные тесты, без API-ключа)'
-        : 'MEASURED (Реальные замеры API провайдера + git worktree + тесты)'
+        ? `MEASURED (Локальный инференс Ollama + ${isoLabel} + реальные тесты, без API-ключа)`
+        : `MEASURED (Реальные замеры API провайдера + ${isoLabel} + тесты)`
       : provenance === 'measured_local'
       ? 'MEASURED_LOCAL (Локальные замеры токенизации и реальные тесты без LLM API)'
       : 'SIMULATED / DEMO FIXTURE (Локальная симуляция — НЕ является измеренным доказательством)';
@@ -25,11 +36,16 @@ export function generateJuryDeliverables(report: AbRunReport): JuryDeliverablesB
       const os = optimized.stages[idx];
       const deltaPct =
         bs.totalTokens > 0
-          ? (((bs.totalTokens - os.totalTokens) / bs.totalTokens) * 100).toFixed(1)
-          : '0.0';
-      return `| ${bs.stageLabel} | ${bs.totalTokens.toLocaleString('ru-RU')} | ${os.totalTokens.toLocaleString('ru-RU')} | **−${deltaPct}%** | ${os.cachedInputTokens.toLocaleString('ru-RU')} | ${os.durationMs} мс | ${bs.provenance} |`;
+          ? Number((((bs.totalTokens - os.totalTokens) / bs.totalTokens) * 100).toFixed(1))
+          : 0;
+      return `| ${bs.stageLabel} | ${bs.totalTokens.toLocaleString('ru-RU')} | ${os.totalTokens.toLocaleString('ru-RU')} | **${formatSavingsPct(deltaPct)}** | ${os.cachedInputTokens.toLocaleString('ru-RU')} | ${os.durationMs} мс | ${bs.provenance} |`;
     })
     .join('\n');
+
+  const baseRefLine =
+    manifest.isolationMode === 'snapshot_copy'
+      ? `- **Isolation Mode / Snapshot SHA-256:** \`snapshot_copy\` · \`${manifest.snapshotHash ?? manifest.baseCommit}\` (не Git commit)`
+      : `- **Isolation Mode / Base Commit:** \`git_worktree\` · \`${manifest.baseCommit}\`${manifest.repoSubpath ? ` (subpath: \`${manifest.repoSubpath}\`)` : ''}`;
 
   const reportMd = `# SpecTrim — Отчёт A/B-эксперимента SDD
 
@@ -39,7 +55,7 @@ ${limitations.length > 0 ? `\n**Ограничения замера:**\n${limita
 
 - **Run ID:** \`${manifest.runId}\`
 - **Репозиторий / Change ID:** \`${manifest.repoName}\` / \`${manifest.changeId}\`
-- **Base Commit:** \`${manifest.baseCommit}\`
+${baseRefLine}
 - **Провайдер и модель (идентичны для A и B):** \`${manifest.provider}\` / \`${manifest.model}\`
 - **Язык и команды проверки:** \`${manifest.detectedLanguage}\` · \`${manifest.testCommand}\` · \`${manifest.lintCommand}\`
 
@@ -47,13 +63,13 @@ ${limitations.length > 0 ? `\n**Ограничения замера:**\n${limita
 
 | Метрика | Baseline | SpecTrim (Optimized) | Изменение | Provenance |
 | --- | ---: | ---: | ---: | --- |
-| **Всего токенов** | ${baseline.totalTokens.toLocaleString('ru-RU')} | ${optimized.totalTokens.toLocaleString('ru-RU')} | **${savings.totalTokensPct !== null ? `−${savings.totalTokensPct}%` : 'n/a'}** | \`${provenance}\` |
-| **Prompt / Input токены** | ${baseline.promptTokens.toLocaleString('ru-RU')} | ${optimized.promptTokens.toLocaleString('ru-RU')} | **${savings.promptTokensPct !== null ? `−${savings.promptTokensPct}%` : 'n/a'}** | \`${provenance}\` |
+| **Всего токенов** | ${baseline.totalTokens.toLocaleString('ru-RU')} | ${optimized.totalTokens.toLocaleString('ru-RU')} | **${formatSavingsPct(savings.totalTokensPct)}** | \`${provenance}\` |
+| **Prompt / Input токены** | ${baseline.promptTokens.toLocaleString('ru-RU')} | ${optimized.promptTokens.toLocaleString('ru-RU')} | **${formatSavingsPct(savings.promptTokensPct)}** | \`${provenance}\` |
 | **Cached Input токены** | ${baseline.cachedInputTokens.toLocaleString('ru-RU')} | ${optimized.cachedInputTokens.toLocaleString('ru-RU')} | cache measured: \`${optimized.cacheUsageMeasured}\` | \`${provenance}\` |
-| **Completion / Output токены** | ${baseline.completionTokens.toLocaleString('ru-RU')} | ${optimized.completionTokens.toLocaleString('ru-RU')} | **${savings.completionTokensPct !== null ? `−${savings.completionTokensPct}%` : 'n/a'}** | \`${provenance}\` |
-| **Расчётная стоимость ($)** | ${baseline.costUsd !== null ? `$${baseline.costUsd.toFixed(4)}` : 'n/a'} | ${optimized.costUsd !== null ? `$${optimized.costUsd.toFixed(4)}` : 'n/a'} | **${savings.costPct !== null ? `−${savings.costPct}%` : 'n/a'}** | \`${provenance}\` |
+| **Completion / Output токены** | ${baseline.completionTokens.toLocaleString('ru-RU')} | ${optimized.completionTokens.toLocaleString('ru-RU')} | **${formatSavingsPct(savings.completionTokensPct)}** | \`${provenance}\` |
+| **Расчётная стоимость ($)** | ${baseline.costUsd !== null ? `$${baseline.costUsd.toFixed(4)}` : 'n/a'} | ${optimized.costUsd !== null ? `$${optimized.costUsd.toFixed(4)}` : 'n/a'} | **${formatSavingsPct(savings.costPct)}** | \`${provenance}\` |
 | **Tool calls / Retries** | ${baseline.toolCalls} / ${baseline.retries} | ${optimized.toolCalls} / ${optimized.retries} | retries: ${savings.retriesDelta >= 0 ? `−${savings.retriesDelta}` : `+${Math.abs(savings.retriesDelta)}`} | \`${provenance}\` |
-| **Итерации LLM-ревью** | ${baseline.reviewIterations} | ${optimized.reviewIterations} | **−${savings.reviewIterationsDelta}** | \`${provenance}\` |
+| **Итерации LLM-ревью** | ${baseline.reviewIterations} | ${optimized.reviewIterations} | **${savings.reviewIterationsDelta >= 0 ? `−${savings.reviewIterationsDelta}` : `+${Math.abs(savings.reviewIterationsDelta)}`}** | \`${provenance}\` |
 | **Время выполнения** | ${(baseline.durationMs / 1000).toFixed(2)} с | ${(optimized.durationMs / 1000).toFixed(2)} с | ${savings.durationDeltaMs >= 0 ? `−${(savings.durationDeltaMs / 1000).toFixed(2)} с` : `+${(Math.abs(savings.durationDeltaMs) / 1000).toFixed(2)} с`} | \`${provenance}\` |
 
 ## 3. Токены по стадиям SDD
@@ -69,6 +85,7 @@ ${stageRows}
 - **Тесты:** Baseline \`${baseline.testsPassed ? 'PASS' : 'FAIL'}\` (${baseline.testsOutputSummary}) · SpecTrim \`${optimized.testsPassed ? 'PASS' : 'FAIL'}\` (${optimized.testsOutputSummary})
 - **Типизация и линтер:** Baseline \`${baseline.lintPassed ? 'PASS' : 'FAIL'}\` · SpecTrim \`${optimized.lintPassed ? 'PASS' : 'FAIL'}\`
 - **Согласованность \`specs ↔ design ↔ tasks\`:** Baseline \`${baseline.artifactConsistency}\` · SpecTrim \`${optimized.artifactConsistency}\`
+- **Quality Parity (100% REQ + Tests + Lint + Consistency):** \`${report.qualityParityPassed ? 'PASS' : 'FAIL'}\`
 `;
 
   const reproducibilityMd = `# Воспроизводимость и запуск SpecTrim CLI / A/B Benchmark

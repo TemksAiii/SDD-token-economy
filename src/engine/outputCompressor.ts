@@ -32,9 +32,77 @@ export interface DeduplicatedReadsResult {
   reductionPct: number;
 }
 
+export interface CompressTestLogOptions {
+  exitCode?: number;
+}
+
+export interface TestRunAnalysis {
+  passed: boolean;
+  executedTests: number | null;
+  failedTests: number;
+  hasFailureSignals: boolean;
+}
+
+export function analyzeTestRunOutput(
+  rawLog: string,
+  exitCode: number
+): TestRunAnalysis {
+  const clean = rawLog.replace(/\x1b\[[0-9;]*m/g, '');
+  let executedTests: number | null = null;
+  let failedTests = 0;
+
+  // node:test TAP summary: "# tests 5", "# pass 4", "# fail 1"
+  const tapTotal = clean.match(/^#\s*tests\s+(\d+)/m);
+  const tapFail = clean.match(/^#\s*fail\s+(\d+)/m);
+  if (tapTotal) {
+    executedTests = Number(tapTotal[1]);
+  }
+  if (tapFail) {
+    failedTests = Number(tapFail[1]);
+  }
+
+  // python unittest: "Ran 3 tests in 0.001s"
+  const unittestMatch = clean.match(/Ran\s+(\d+)\s+tests?\s+in/i);
+  if (unittestMatch) {
+    executedTests = Number(unittestMatch[1]);
+  }
+  const unittestFailed = clean.match(/FAILED\s*\((?:failures=(\d+))?(?:,\s*)?(?:errors=(\d+))?/i);
+  if (unittestFailed) {
+    failedTests += Number(unittestFailed[1] || 0) + Number(unittestFailed[2] || 0);
+  }
+
+  // pytest: "1 failed, 12 passed" or "12 passed"
+  const pytestFail = clean.match(/(\d+)\s+failed/i);
+  const pytestPass = clean.match(/(\d+)\s+passed/i);
+  if (pytestFail || pytestPass) {
+    const f = pytestFail ? Number(pytestFail[1]) : 0;
+    const p = pytestPass ? Number(pytestPass[1]) : 0;
+    executedTests = f + p;
+    failedTests = Math.max(failedTests, f);
+  }
+
+  const hasFailureSignals =
+    failedTests > 0 ||
+    /^(?:FAILED|FAIL\b|not ok \d+|panic:|---\s+FAIL:|✖\s+|×\s+)/m.test(clean) ||
+    /(?:AssertionError|ERR_ASSERTION|ERR_MODULE_NOT_FOUND|Error\s+\[ERR_|TypeError:|SyntaxError:|ReferenceError:|Transform failed|TSError|Cannot find module)/.test(
+      clean
+    );
+
+  const zeroTestsExecuted = executedTests !== null && executedTests === 0;
+  const passed = exitCode === 0 && failedTests === 0 && !hasFailureSignals && !zeroTestsExecuted;
+
+  return {
+    passed,
+    executedTests,
+    failedTests,
+    hasFailureSignals,
+  };
+}
+
 export function compressTestLog(
   rawLog: string,
-  runner: TestRunnerKind = 'pytest'
+  runner: TestRunnerKind = 'pytest',
+  options: CompressTestLogOptions = {}
 ): CompressedOutputResult {
   const lines = rawLog.split(/\r?\n/);
   const totalLines = lines.length;
@@ -47,10 +115,35 @@ export function compressTestLog(
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const trimmed = line.trim();
-
-    // Strip ANSI escape codes & progress indicators
     const clean = line.replace(/\x1b\[[0-9;]*m/g, '');
+    const trimmed = clean.trim();
+
+    const isExplicitFailure =
+      /^(FAILED|FAIL\b|not ok \d+|AssertionError|ERR_ASSERTION|ERR_MODULE_NOT_FOUND|TypeError:|SyntaxError:|ReferenceError:|Transform failed|TSError|Cannot find module|Error:|Error\s+\[ERR_|panic:|---\s+FAIL:|✖\s+|×\s+|Expected:|Received:)/.test(
+        trimmed
+      ) ||
+      trimmed.includes('FAILED ') ||
+      trimmed.includes('AssertionError') ||
+      trimmed.includes('ERR_ASSERTION') ||
+      trimmed.includes('ERR_MODULE_NOT_FOUND') ||
+      trimmed.includes('Transform failed') ||
+      trimmed.includes('Cannot find module') ||
+      /^#\s*fail\s+[1-9]\d*/i.test(trimmed);
+
+    if (isExplicitFailure) {
+      inFailureBlock = true;
+      failureContextBudget = 12;
+      if (
+        /^(FAILED|not ok \d+|---\s+FAIL:|✖\s+|×\s+|TypeError:|SyntaxError:|ReferenceError:|Transform failed|Error)/.test(
+          trimmed
+        ) ||
+        trimmed.includes('Cannot find module')
+      ) {
+        detectedFailures.push(trimmed);
+      }
+      kept.push(clean);
+      continue;
+    }
 
     if (
       /^\s*(PASSED|ok\s+\d+|ok\s+[^-]|✓|\s*\[[0-9/]+\]|platform |rootdir:|collecting|cachedir:|plugins:|TAP version|duration_ms:|type:\s*'test'|\.\.\.$)/.test(
@@ -58,23 +151,6 @@ export function compressTestLog(
       ) ||
       / \.\.\. ok$/.test(clean)
     ) {
-      continue;
-    }
-
-    if (
-      /^(FAILED|FAIL|not ok \d+|AssertionError|ERR_ASSERTION|E\s+assert|Error:|panic:|---\s+FAIL:|×\s+|Expected:|Received:)/.test(
-        trimmed
-      ) ||
-      trimmed.includes('FAILED ') ||
-      trimmed.includes('AssertionError') ||
-      trimmed.includes('ERR_ASSERTION')
-    ) {
-      inFailureBlock = true;
-      failureContextBudget = 12;
-      if (/^(FAILED|not ok \d+|---\s+FAIL:|×\s+)/.test(trimmed)) {
-        detectedFailures.push(trimmed);
-      }
-      kept.push(clean);
       continue;
     }
 
@@ -107,7 +183,34 @@ export function compressTestLog(
     }
   }
 
-  if (kept.length === 0) {
+  const exitFailed = typeof options.exitCode === 'number' && options.exitCode !== 0;
+  const analysis = analyzeTestRunOutput(rawLog, options.exitCode ?? 0);
+
+  // Never report ALL TESTS GREEN if exitCode != 0 or failure signals were present
+  const onlyPassingSummary =
+    kept.length === 0 ||
+    (exitFailed && detectedFailures.length === 0 && kept.every((l) => /^#\s*(tests|pass|fail 0)/.test(l.trim())));
+
+  if (exitFailed || analysis.hasFailureSignals || !analysis.passed) {
+    if (onlyPassingSummary) {
+      const nonEmptyTail = lines
+        .map((l) => l.replace(/\x1b\[[0-9;]*m/g, ''))
+        .filter((l) => l.trim().length > 0)
+        .slice(-15);
+      kept.length = 0;
+      kept.push(
+        `[${runner}: TESTS FAILED (exit ${options.exitCode ?? 'non-zero'}) — ${totalLines} log lines, tail:]`,
+        ...nonEmptyTail
+      );
+      if (detectedFailures.length === 0 && nonEmptyTail.length > 0) {
+        detectedFailures.push(nonEmptyTail[0].trim());
+      }
+    } else {
+      kept.unshift(
+        `[SpecTrim Log Compressor (${runner}, exit ${options.exitCode ?? 'fail'}): kept ${kept.length}/${totalLines} signal lines]`
+      );
+    }
+  } else if (kept.length === 0) {
     kept.push(`[${runner}: ALL TESTS GREEN — ${totalLines} noisy log lines stripped]`);
   } else {
     kept.unshift(

@@ -52,10 +52,16 @@ export function runSafeCommand(
       return;
     }
 
+    const binDir = path.resolve(process.cwd(), 'node_modules', '.bin');
+    const currentPath = process.env.PATH || '';
+    const nextPath = currentPath.split(path.delimiter).includes(binDir)
+      ? currentPath
+      : `${binDir}${path.delimiter}${currentPath}`;
+
     const child = spawn(bin, args, {
       cwd,
       shell: false,
-      env: process.env,
+      env: { ...process.env, PATH: nextPath },
     });
 
     let stdout = '';

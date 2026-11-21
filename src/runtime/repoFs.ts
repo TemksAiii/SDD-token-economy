@@ -1,3 +1,5 @@
+import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { OpenSpecBundle } from '../engine/specSlicer';
@@ -7,6 +9,15 @@ import { TestRunnerKind } from '../engine/outputCompressor';
 import { GateSourceFile } from '../engine/preReviewGate';
 import { resolveConfinedPath, sanitizeIdSegment, WORKSPACE_ROOT } from './pathGuard';
 import { hasExecutable } from './execUtils';
+
+export interface GitContextInfo {
+  isGitRepo: boolean;
+  gitRoot: string | null;
+  absGitRoot: string | null;
+  repoSubpath: string;
+  headCommit: string | null;
+  isolationCapability: 'git_worktree' | 'snapshot_copy';
+}
 
 export interface DetectedRepoInfo {
   repoPath: string; // workspace-relative
@@ -21,6 +32,9 @@ export interface DetectedRepoInfo {
   changes: string[];
   sourceFileCount: number;
   isGitRepo: boolean;
+  gitRoot: string | null;
+  repoSubpath: string;
+  isolationCapability: 'git_worktree' | 'snapshot_copy';
 }
 
 const SKIP_DIRS = new Set([
@@ -37,6 +51,118 @@ const SKIP_DIRS = new Set([
 ]);
 
 const CODE_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.py', '.go', '.java']);
+
+export function inspectGitContext(absRepo: string): GitContextInfo {
+  try {
+    const inside = execFileSync('git', ['rev-parse', '--is-inside-work-tree'], {
+      cwd: absRepo,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    if (inside !== 'true') {
+      return {
+        isGitRepo: false,
+        gitRoot: null,
+        absGitRoot: null,
+        repoSubpath: '',
+        headCommit: null,
+        isolationCapability: 'snapshot_copy',
+      };
+    }
+
+    const rawTop = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd: absRepo,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    const absGitRoot = fs.realpathSync(path.resolve(rawTop));
+    const realAbsRepo = fs.realpathSync(absRepo);
+
+    const headCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: absGitRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+
+    if (!headCommit) {
+      return {
+        isGitRepo: false,
+        gitRoot: null,
+        absGitRoot: null,
+        repoSubpath: '',
+        headCommit: null,
+        isolationCapability: 'snapshot_copy',
+      };
+    }
+
+    const repoSubpath = path.relative(absGitRoot, realAbsRepo).replace(/\\/g, '/');
+    const relRoot = path.relative(WORKSPACE_ROOT, absGitRoot).replace(/\\/g, '/');
+    const displayGitRoot = relRoot === '' ? '.' : relRoot.startsWith('..') ? path.basename(absGitRoot) : relRoot;
+
+    return {
+      isGitRepo: true,
+      gitRoot: displayGitRoot,
+      absGitRoot,
+      repoSubpath: repoSubpath === '.' ? '' : repoSubpath,
+      headCommit,
+      isolationCapability: 'git_worktree',
+    };
+  } catch {
+    return {
+      isGitRepo: false,
+      gitRoot: null,
+      absGitRoot: null,
+      repoSubpath: '',
+      headCommit: null,
+      isolationCapability: 'snapshot_copy',
+    };
+  }
+}
+
+export function computeRepoSnapshotHash(absRepo: string): string {
+  const hash = crypto.createHash('sha256');
+  const filePaths: string[] = [];
+
+  const walk = (dir: string) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (SKIP_DIRS.has(entry.name)) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.isFile()) {
+        filePaths.push(path.relative(absRepo, full).replace(/\\/g, '/'));
+      }
+    }
+  };
+
+  walk(absRepo);
+  filePaths.sort();
+  for (const rel of filePaths) {
+    hash.update(rel);
+    hash.update('\0');
+    hash.update(fs.readFileSync(path.join(absRepo, rel)));
+    hash.update('\0');
+  }
+  return hash.digest('hex');
+}
+
+export function copyRepoSnapshot(absRepo: string, destDir: string): void {
+  fs.mkdirSync(destDir, { recursive: true });
+  const copyWalk = (srcDir: string, dstDir: string) => {
+    for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+      if (SKIP_DIRS.has(entry.name)) continue;
+      const srcPath = path.join(srcDir, entry.name);
+      const dstPath = path.join(dstDir, entry.name);
+      if (entry.isDirectory()) {
+        fs.mkdirSync(dstPath, { recursive: true });
+        copyWalk(srcPath, dstPath);
+      } else if (entry.isFile()) {
+        fs.copyFileSync(srcPath, dstPath);
+      }
+    }
+  };
+  copyWalk(absRepo, destDir);
+}
 
 export function detectRepoOnDisk(repoInputPath: string): DetectedRepoInfo {
   const absRepo = resolveConfinedPath(repoInputPath);
@@ -92,6 +218,7 @@ export function detectRepoOnDisk(repoInputPath: string): DetectedRepoInfo {
 
   const files = collectRepoFiles(absRepo);
   const relRepo = path.relative(WORKSPACE_ROOT, absRepo) || '.';
+  const gitCtx = inspectGitContext(absRepo);
 
   return {
     repoPath: relRepo,
@@ -105,7 +232,10 @@ export function detectRepoOnDisk(repoInputPath: string): DetectedRepoInfo {
     specMarkerSyntax: stack.specMarkerSyntax,
     changes,
     sourceFileCount: files.length,
-    isGitRepo: fs.existsSync(path.join(absRepo, '.git')),
+    isGitRepo: gitCtx.isGitRepo,
+    gitRoot: gitCtx.gitRoot,
+    repoSubpath: gitCtx.repoSubpath,
+    isolationCapability: gitCtx.isolationCapability,
   };
 }
 

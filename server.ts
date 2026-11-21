@@ -417,12 +417,7 @@ async function startServer() {
       }
 
       // Validate repository & OpenSpec change upfront before spawning background run
-      const repoInfo = detectRepoOnDisk(repoPath);
-      if (!repoInfo.isGitRepo) {
-        return res.status(400).json({
-          error: `Репозиторий ${repoInfo.repoPath} не является git-репозиторием; git worktree невозможен.`,
-        });
-      }
+      detectRepoOnDisk(repoPath);
       readOpenSpecBundleFromDisk(repoPath, changeId);
 
       const jobId = `job-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;

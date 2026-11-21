@@ -76,9 +76,9 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
     1
   );
 
-  const gitRepos = (status?.repos ?? []).filter((r) => r.isGitRepo && r.changes.length > 0);
+  const runnableRepos = (status?.repos ?? []).filter((r) => r.changes.length > 0);
   const currentRepo =
-    gitRepos.find((r) => r.repoPath === selectedRepoPath) ?? gitRepos[0] ?? null;
+    runnableRepos.find((r) => r.repoPath === selectedRepoPath) ?? runnableRepos[0] ?? null;
   const allAvailableModels = status?.provider.availableModels ?? [];
   const modelsForSelectedProvider = allAvailableModels.filter(
     (m) => m.provider === selectedProvider
@@ -154,6 +154,18 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
   const pct = (b: number, o: number) =>
     b > 0 ? Number((((b - o) / b) * 100).toFixed(1)) : 0;
 
+  const formatDelta = (val: number | null) => {
+    if (val === null) return 'n/a';
+    if (val > 0) return `−${val}%`;
+    if (val < 0) return `+${Math.abs(val)}%`;
+    return '0%';
+  };
+
+  const deltaColor = (val: number | null) => {
+    if (val === null || val === 0) return 'text-slate-600';
+    return val > 0 ? 'text-emerald-700' : 'text-red-700';
+  };
+
   return (
     <div className="space-y-8">
       {/* Intro & Mode Selector */}
@@ -162,7 +174,7 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
           <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
             <span>OpenCode + OpenSpec</span>
             <span aria-hidden="true">·</span>
-            <span>Идентичный commit, модель и провайдер для A и B</span>
+            <span>Идентичный снимок/commit, модель и провайдер для A и B</span>
             <span aria-hidden="true">·</span>
             <span>Без model routing</span>
           </div>
@@ -170,7 +182,7 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
             A/B-стенд экономии токенов в Spec-Driven Development
           </h1>
           <p className="text-sm sm:text-base text-slate-600 leading-relaxed">
-            Изолированный A/B-прогон в двух <code className="font-mono text-xs bg-slate-100 px-1.5 py-0.5 rounded">git worktree</code> поверх реальных репозиториев и OpenSpec-артефактов с фиксацией <code className="font-mono text-xs bg-slate-100 px-1.5 py-0.5 rounded">usageMetadata</code>.
+            Изолированный A/B-прогон в двух <code className="font-mono text-xs bg-slate-100 px-1.5 py-0.5 rounded">git worktree</code> (или идентичных <code className="font-mono text-xs bg-slate-100 px-1.5 py-0.5 rounded">snapshot_copy</code> без <code className="font-mono text-xs bg-slate-100 px-1.5 py-0.5 rounded">.git</code>) поверх реальных репозиториев и OpenSpec-артефактов с фиксацией <code className="font-mono text-xs bg-slate-100 px-1.5 py-0.5 rounded">usageMetadata</code>.
           </p>
         </div>
 
@@ -220,13 +232,16 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
           <span>
             Достоверность активного отчёта:{' '}
             {provenance === 'measured' && manifest.provider === 'ollama'
-              ? 'MEASURED · Локальная Ollama + Git Worktree (без API-ключа)'
+              ? `MEASURED · Локальная Ollama + ${manifest.isolationMode === 'snapshot_copy' ? 'Snapshot Copy (без .git)' : 'Git Worktree'} (без API-ключа)`
+              : provenance === 'measured' && manifest.isolationMode === 'snapshot_copy'
+              ? 'MEASURED · API + Snapshot Copy (без .git)'
               : PROVENANCE_LABEL[provenance]}
           </span>
           <span className="font-mono text-slate-700">
-            provider: {manifest.provider} · runId: {manifest.runId} · commit:{' '}
-            {manifest.baseCommit.length > 12
-              ? manifest.baseCommit.slice(0, 10)
+            provider: {manifest.provider} · runId: {manifest.runId} ·{' '}
+            {manifest.isolationMode === 'snapshot_copy' ? 'snapshot' : 'commit'}:{' '}
+            {manifest.baseCommit.length > 16
+              ? manifest.baseCommit.slice(0, 14)
               : manifest.baseCommit}
           </span>
         </div>
@@ -239,9 +254,9 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
         )}
       </section>
 
-      {/* Real Isolated Worktree A/B Execution Panel */}
+      {/* Real Isolated Worktree / Snapshot A/B Execution Panel */}
       <section
-        aria-label="Запуск реального git worktree A/B-эксперимента"
+        aria-label="Запуск реального изолированного A/B-эксперимента"
         className="bg-white border border-slate-200 rounded-xl p-6 space-y-5"
       >
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
@@ -249,11 +264,13 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
             <div className="flex items-center gap-2">
               <GitBranch className="w-4 h-4 text-blue-600 shrink-0" aria-hidden="true" />
               <h2 className="text-base font-semibold text-slate-900">
-                Реальный A/B-прогон в изолированных git worktree
+                Реальный изолированный A/B-прогон ({currentRepo?.isolationCapability === 'snapshot_copy' ? 'snapshot copy' : 'git worktree'})
               </h2>
             </div>
             <p className="text-xs text-slate-600">
-              Создаёт два отдельных worktree от одного commit SHA, прогоняет Baseline и SpecTrim на одной модели, запускает реальные тесты и сохраняет <code className="font-mono">metrics.jsonl</code> + diff в <code className="font-mono">.spectrim-runs/</code>.
+              {currentRepo?.isolationCapability === 'snapshot_copy'
+                ? 'В текущем контейнере нет .git — создаёт две идентичные изолированные копии снимка (SHA-256), прогоняет Baseline и SpecTrim на одной модели, запускает реальные тесты и сохраняет metrics.jsonl + diff в .spectrim-runs/.'
+                : 'Создаёт два отдельных worktree от одного commit SHA, прогоняет Baseline и SpecTrim на одной модели, запускает реальные тесты и сохраняет metrics.jsonl + diff в .spectrim-runs/.'}
             </p>
           </div>
 
@@ -284,7 +301,7 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-4">
           <div className="lg:col-span-2">
             <label htmlFor="ab-repo" className="block text-xs font-medium text-slate-700 mb-1">
-              Git-репозиторий
+              Репозиторий полигона
             </label>
             <select
               id="ab-repo"
@@ -293,12 +310,12 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
               disabled={statusLoading || isRunningReal}
               className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-mono text-slate-900"
             >
-              {gitRepos.length === 0 ? (
+              {runnableRepos.length === 0 ? (
                 <option value="benchmarks/orders-ts">benchmarks/orders-ts</option>
               ) : (
-                gitRepos.map((r) => (
+                runnableRepos.map((r) => (
                   <option key={r.repoPath} value={r.repoPath}>
-                    {r.repoPath} ({r.language})
+                    {r.repoPath} ({r.language} · {r.isolationCapability === 'git_worktree' ? 'git' : 'snapshot'})
                   </option>
                 ))
               )}
@@ -464,10 +481,10 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
         <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-2">
           <div className="text-xs font-medium text-slate-500">Общий расход токенов</div>
           <div className="flex items-baseline justify-between gap-2">
-            <span className="text-2xl font-bold text-slate-900 tabular-nums">
-              {savings.totalTokensPct !== null ? `−${savings.totalTokensPct}%` : 'n/a'}
+            <span className={`text-2xl font-bold tabular-nums ${savings.totalTokensPct !== null && savings.totalTokensPct < 0 ? 'text-red-700' : 'text-slate-900'}`}>
+              {formatDelta(savings.totalTokensPct)}
             </span>
-            <span className="text-xs font-semibold text-emerald-700 tabular-nums">
+            <span className={`text-xs font-semibold tabular-nums ${deltaColor(savings.totalTokensPct)}`}>
               {optimized.totalTokens.toLocaleString('ru-RU')} ток.
             </span>
           </div>
@@ -480,10 +497,10 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
           <div className="text-xs font-medium text-slate-500">Стоимость и Cached Input</div>
           <div className="flex items-baseline justify-between gap-2">
             <span className="text-2xl font-bold text-slate-900 tabular-nums">
-              {savings.costPct !== null ? `−${savings.costPct}%` : 'n/a'}
+              {formatDelta(savings.costPct)}
             </span>
-            <span className="text-xs font-medium text-slate-600 tabular-nums">
-              Out: {savings.completionTokensPct !== null ? `−${savings.completionTokensPct}%` : 'n/a'}
+            <span className={`text-xs font-medium tabular-nums ${deltaColor(savings.completionTokensPct)}`}>
+              Out: {formatDelta(savings.completionTokensPct)}
             </span>
           </div>
           <div className="text-xs text-slate-500 tabular-nums">
@@ -511,17 +528,30 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
         <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-2">
           <div className="text-xs font-medium text-slate-500">Контроль качества (Parity)</div>
           <div className="flex items-baseline justify-between gap-2">
-            <span className="text-2xl font-bold text-emerald-700 tabular-nums">
+            <span
+              className={`text-2xl font-bold tabular-nums ${
+                optimized.reqCoveragePct === 100 ? 'text-emerald-700' : 'text-amber-700'
+              }`}
+            >
               {optimized.reqCoveragePct}% REQ
             </span>
-            <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700">
-              <ShieldCheck className="w-3.5 h-3.5" aria-hidden="true" />
-              {optimized.testsPassed ? 'Тесты PASS' : 'Тесты FAIL'}
-            </span>
+            {optimized.testsPassed ? (
+              <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700">
+                <ShieldCheck className="w-3.5 h-3.5" aria-hidden="true" />
+                Тесты PASS
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1 text-xs font-semibold text-red-700">
+                <AlertTriangle className="w-3.5 h-3.5" aria-hidden="true" />
+                Тесты FAIL
+              </span>
+            )}
           </div>
           <div className="text-xs text-slate-500 tabular-nums">
             Задачи: {optimized.tasksCompleted}/{optimized.tasksTotal} · Lint:{' '}
-            {optimized.lintPassed ? 'PASS' : 'FAIL'}
+            <span className={optimized.lintPassed ? 'text-emerald-700 font-semibold' : 'text-red-700 font-semibold'}>
+              {optimized.lintPassed ? 'PASS' : 'FAIL'}
+            </span>
           </div>
         </div>
       </section>
@@ -568,8 +598,8 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
                           {os.totalTokens.toLocaleString('ru-RU')}
                         </strong>
                       </span>
-                      <span className="font-semibold text-emerald-700 min-w-[3.5rem] text-right">
-                        −{stageSaving}%
+                      <span className={`font-semibold min-w-[3.5rem] text-right ${deltaColor(stageSaving)}`}>
+                        {formatDelta(stageSaving)}
                       </span>
                     </div>
                   </div>
@@ -750,8 +780,21 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
               </div>
               <dl className="divide-y divide-slate-100 text-xs">
                 <div className="py-2 flex justify-between gap-2">
-                  <dt className="text-slate-500">Base Commit</dt>
-                  <dd className="font-mono text-slate-900">{manifest.baseCommit.slice(0, 12)}</dd>
+                  <dt className="text-slate-500">Изоляция A/B</dt>
+                  <dd className="font-mono text-slate-900">
+                    {manifest.isolationMode === 'snapshot_copy' ? 'snapshot_copy' : 'git_worktree'}
+                    {manifest.repoSubpath ? ` (${manifest.repoSubpath})` : ''}
+                  </dd>
+                </div>
+                <div className="py-2 flex justify-between gap-2">
+                  <dt className="text-slate-500">
+                    {manifest.isolationMode === 'snapshot_copy' ? 'Snapshot SHA-256' : 'Base Commit'}
+                  </dt>
+                  <dd className="font-mono text-slate-900">
+                    {manifest.baseCommit.length > 16
+                      ? manifest.baseCommit.slice(0, 14)
+                      : manifest.baseCommit}
+                  </dd>
                 </div>
                 <div className="py-2 flex justify-between gap-2">
                   <dt className="text-slate-500">Провайдер / Модель</dt>
@@ -771,7 +814,11 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
                 </div>
                 <div className="py-2 flex justify-between gap-2">
                   <dt className="text-slate-500">Artifact consistency</dt>
-                  <dd className="font-mono text-emerald-700">
+                  <dd
+                    className={`font-mono font-semibold ${
+                      optimized.artifactConsistency ? 'text-emerald-700' : 'text-red-700'
+                    }`}
+                  >
                     {optimized.artifactConsistency ? 'PASS' : 'FAIL'}
                   </dd>
                 </div>
@@ -794,9 +841,9 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
             Детализация токенов: Prompt / Cached / Completion по стадиям
           </h2>
           <span className="text-xs text-slate-500 tabular-nums">
-            Prompt {savings.promptTokensPct !== null ? `−${savings.promptTokensPct}%` : 'n/a'} ·
+            Prompt {formatDelta(savings.promptTokensPct)} ·
             Cached: {optimized.cachedInputTokens.toLocaleString('ru-RU')} · Completion{' '}
-            {savings.completionTokensPct !== null ? `−${savings.completionTokensPct}%` : 'n/a'}
+            {formatDelta(savings.completionTokensPct)}
           </span>
         </div>
         <div className="overflow-x-auto">
@@ -843,8 +890,8 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
                     <td className="py-3 px-4 text-right text-slate-900 font-mono text-xs font-semibold">
                       {os.totalTokens.toLocaleString('ru-RU')}
                     </td>
-                    <td className="py-3 px-4 text-right font-mono text-xs font-semibold text-emerald-700">
-                      −{stageSaving}%
+                    <td className={`py-3 px-4 text-right font-mono text-xs font-semibold ${deltaColor(stageSaving)}`}>
+                      {formatDelta(stageSaving)}
                     </td>
                   </tr>
                 );
@@ -872,8 +919,8 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
                 <td className="py-3 px-4 text-right font-mono text-xs text-slate-900">
                   {optimized.totalTokens.toLocaleString('ru-RU')}
                 </td>
-                <td className="py-3 px-4 text-right font-mono text-xs text-emerald-700">
-                  {savings.totalTokensPct !== null ? `−${savings.totalTokensPct}%` : 'n/a'}
+                <td className={`py-3 px-4 text-right font-mono text-xs ${deltaColor(savings.totalTokensPct)}`}>
+                  {formatDelta(savings.totalTokensPct)}
                 </td>
               </tr>
             </tbody>

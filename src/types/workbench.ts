@@ -17,6 +17,9 @@ export interface WorkspaceRepoInfo {
   changes: string[];
   sourceFileCount: number;
   isGitRepo: boolean;
+  gitRoot: string | null;
+  repoSubpath: string;
+  isolationCapability: 'git_worktree' | 'snapshot_copy';
 }
 
 export interface SavedRunSummary {

@@ -216,23 +216,138 @@ export function extractAstSkeleton(
   }
 
   // TypeScript / JavaScript
+  const countBracesOutsideStrings = (src: string): number => {
+    const stripped = src
+      .replace(/\/\/.*$/, '')
+      .replace(/'(?:\\.|[^'\\])*'/g, "''")
+      .replace(/"(?:\\.|[^"\\])*"/g, '""')
+      .replace(/`(?:\\.|[^`\\])*`/g, '``');
+    return (stripped.match(/\{/g)?.length ?? 0) - (stripped.match(/\}/g)?.length ?? 0);
+  };
+  const methodStartRe =
+    /^(?:public\s+|private\s+|protected\s+|readonly\s+|static\s+|async\s+|override\s+|get\s+|set\s+)*(?:constructor|[A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>=]+>)?\s*\(/;
+
+  let inInterfaceOrTypeBlock = false;
+  let blockBraceDepth = 0;
+  let classDepth = 0;
+  let inMultiLineSig = false;
+  let sigParenDepth = 0;
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const trimmed = line.trim();
-    if (
+
+    if (inMultiLineSig) {
+      const hash = shortLineHash(line);
+      sigParenDepth += (trimmed.match(/\(/g)?.length ?? 0) - (trimmed.match(/\)/g)?.length ?? 0);
+      const endsSig = sigParenDepth <= 0 && (trimmed.endsWith('{') || trimmed.endsWith('{}') || trimmed.endsWith(';'));
+      const renderedLine =
+        endsSig && trimmed.endsWith('{') && !trimmed.endsWith('{}')
+          ? `${line} /* ... */ }`
+          : line;
+      out.push(`L${i + 1}#${hash}: ${renderedLine}`);
+      if (classDepth > 0) {
+        classDepth = Math.max(0, classDepth + countBracesOutsideStrings(line));
+      }
+      if (endsSig) {
+        inMultiLineSig = false;
+        sigParenDepth = 0;
+      }
+      continue;
+    }
+
+    const isClassHeader =
+      trimmed.startsWith('export class ') ||
+      trimmed.startsWith('export abstract class ') ||
+      trimmed.startsWith('class ') ||
+      trimmed.startsWith('abstract class ');
+
+    const isInterfaceOrTypeHeader =
+      trimmed.startsWith('export interface ') ||
+      trimmed.startsWith('interface ') ||
+      (trimmed.startsWith('export type ') && trimmed.includes('{'));
+
+    const isTopLevelDecl =
       trimmed.startsWith('import ') ||
       trimmed.startsWith('export interface ') ||
       trimmed.startsWith('export type ') ||
-      trimmed.startsWith('export class ') ||
+      trimmed.startsWith('export enum ') ||
+      isClassHeader ||
       trimmed.startsWith('export async function ') ||
       trimmed.startsWith('export function ') ||
       trimmed.startsWith('export const ') ||
-      trimmed.includes('@spec:')
-    ) {
+      trimmed.startsWith('interface ') ||
+      trimmed.includes('@spec:');
+
+    if (isInterfaceOrTypeHeader) {
       const hash = shortLineHash(line);
-      const folded = trimmed.endsWith('{')
-        ? `${line} /* ... */ }`
-        : line;
+      out.push(`L${i + 1}#${hash}: ${line}`);
+      inInterfaceOrTypeBlock = true;
+      blockBraceDepth = countBracesOutsideStrings(line);
+      if (blockBraceDepth <= 0) {
+        inInterfaceOrTypeBlock = false;
+      }
+      continue;
+    } else if (inInterfaceOrTypeBlock) {
+      blockBraceDepth += countBracesOutsideStrings(line);
+      if (trimmed && !trimmed.startsWith('//')) {
+        const hash = shortLineHash(line);
+        out.push(`L${i + 1}#${hash}: ${line}`);
+      }
+      if (blockBraceDepth <= 0) {
+        inInterfaceOrTypeBlock = false;
+      }
+      continue;
+    }
+
+    if (isClassHeader) {
+      const hash = shortLineHash(line);
+      out.push(`L${i + 1}#${hash}: ${line}`);
+      classDepth += countBracesOutsideStrings(line);
+      continue;
+    }
+
+    const isTopLevelMethodSig =
+      classDepth === 1 &&
+      methodStartRe.test(trimmed) &&
+      !/^(?:if|for|while|switch|catch|return|throw|new)\b/.test(trimmed);
+
+    const isStandaloneSig =
+      !isTopLevelDecl &&
+      classDepth === 0 &&
+      /^(?:public\s+|private\s+|protected\s+|readonly\s+|static\s+|async\s+)*(?:constructor|[A-Za-z0-9_]+)\s*(?:<[^>{]+>)?\s*\([^;]*\)\s*(?::\s*[^\{;]+)?\s*\{?$/.test(
+        trimmed
+      ) &&
+      !/^(?:if|for|while|switch|catch|return|throw|new)\b/.test(trimmed);
+
+    if (isTopLevelMethodSig) {
+      const hash = shortLineHash(line);
+      const pDelta = (trimmed.match(/\(/g)?.length ?? 0) - (trimmed.match(/\)/g)?.length ?? 0);
+      if (pDelta > 0 || (!trimmed.endsWith('{') && !trimmed.endsWith('{}') && !trimmed.endsWith(';'))) {
+        inMultiLineSig = true;
+        sigParenDepth = pDelta;
+        out.push(`L${i + 1}#${hash}: ${line}`);
+      } else {
+        const folded =
+          trimmed.endsWith('{') && !trimmed.endsWith('{}') ? `${line} /* ... */ }` : line;
+        out.push(`L${i + 1}#${hash}: ${folded}`);
+      }
+      classDepth = Math.max(0, classDepth + countBracesOutsideStrings(line));
+      continue;
+    }
+
+    if (classDepth > 0) {
+      classDepth = Math.max(0, classDepth + countBracesOutsideStrings(line));
+      if (trimmed.includes('@spec:')) {
+        const hash = shortLineHash(line);
+        out.push(`L${i + 1}#${hash}: ${line}`);
+      }
+      continue;
+    }
+
+    if (isTopLevelDecl || isStandaloneSig) {
+      const hash = shortLineHash(line);
+      const folded = trimmed.endsWith('{') ? `${line} /* ... */ }` : line;
       out.push(`L${i + 1}#${hash}: ${folded}`);
     }
   }

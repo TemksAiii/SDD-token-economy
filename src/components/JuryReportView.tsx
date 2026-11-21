@@ -101,7 +101,9 @@ export const JuryReportView: React.FC<JuryReportViewProps> = ({
       <div className="border-b border-slate-200 pb-5 space-y-2">
         <div className="text-xs text-slate-500">
           {report.provenance === 'measured' && report.manifest.provider === 'ollama'
-            ? 'MEASURED · Локальная Ollama + Git Worktree (без API-ключа)'
+            ? `MEASURED · Локальная Ollama + ${report.manifest.isolationMode === 'snapshot_copy' ? 'Snapshot Copy (без .git)' : 'Git Worktree'} (без API-ключа)`
+            : report.provenance === 'measured' && report.manifest.isolationMode === 'snapshot_copy'
+            ? 'MEASURED · API + Snapshot Copy (без .git)'
             : PROVENANCE_LABEL[report.provenance]}{' '}
           · {report.manifest.provider} / {report.manifest.model} · Run ID: {report.manifest.runId}
         </div>

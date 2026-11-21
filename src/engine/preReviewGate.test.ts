@@ -42,3 +42,26 @@ test('runPreReviewGate catches missing @spec:REQ-07 test and unchecked tasks for
   assert.deepEqual(res.uncheckedTasks, ['TSK-07']);
   assert.match(res.conciseReport, /GATE BLOCKED/);
 });
+
+test('runPreReviewGate with verifySubstance catches trivial stub tests with @spec markers', () => {
+  const stubFiles = DEMO_GATE_FILES.map((f) =>
+    f.isTest
+      ? {
+          ...f,
+          content: `// @spec:REQ-01 @spec:REQ-02 @spec:REQ-07 @spec:REQ-08\nimport test from 'node:test';\nimport assert from 'node:assert/strict';\ntest('stub', () => {\n  assert.ok(true);\n});`,
+        }
+      : f
+  );
+
+  const res = runPreReviewGate({
+    bundle: DEMO_OPENSPEC_BUNDLE,
+    files: stubFiles,
+    testsPassing: true,
+    lintErrors: [],
+    verifySubstance: true,
+  });
+
+  assert.equal(res.passed, false);
+  assert.ok(res.substanceErrors.length >= 2);
+  assert.match(res.conciseReport, /GATE BLOCKED/);
+});

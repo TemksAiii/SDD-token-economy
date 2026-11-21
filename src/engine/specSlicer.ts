@@ -120,7 +120,17 @@ export function parseOpenSpecBundle(bundle: OpenSpecBundle): TraceabilityGraph {
       const linkedReqs = extractIds(rest, 'REQ');
       const linkedDesigns = extractIds(rest, 'DES');
       const fileMatches = rest.match(/`([^`]+\.[a-zA-Z0-9]+)`/g) ?? [];
-      const targetFiles = fileMatches.map((f) => f.replace(/`/g, ''));
+      const targetFiles = fileMatches
+        .map((f) => f.replace(/`/g, '').trim())
+        .filter((candidate) => {
+          if (!candidate || candidate.includes('..') || candidate.startsWith('@') || /[\s:()]/.test(candidate)) {
+            return false;
+          }
+          if (candidate.includes('/')) return true;
+          return /\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|java|kt|rs|rb|php|cs|cpp|c|h|json|md|toml|ya?ml|xml|sql|css|html|sh|txt)$/i.test(
+            candidate
+          );
+        });
       const cleanTitle = rest
         .replace(/\((?:REQ|DES)-[^)]+\)/g, '')
         .replace(/\[(?:REQ|DES)-\d+\]/g, '')

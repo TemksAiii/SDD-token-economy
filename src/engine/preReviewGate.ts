@@ -13,6 +13,7 @@ export interface GateExecutionInput {
   testsPassing: boolean;
   failingTestSnippet?: string;
   lintErrors: string[];
+  verifySubstance?: boolean;
 }
 
 export interface GateCheckItem {
@@ -33,8 +34,81 @@ export interface PreReviewGateResult {
   uncoveredReqsInTests: string[];
   uncheckedTasks: string[];
   consistencyErrors: string[];
+  substanceErrors: string[];
   conciseReport: string;
   reportTokens: number;
+}
+
+function isTestFilePath(filePath: string): boolean {
+  return (
+    filePath.startsWith('tests/') ||
+    filePath.includes('/tests/') ||
+    filePath.includes('/test/') ||
+    /\.test\.[a-z]+$|^test_.*\.py$|_test\.go$|Test\.java$/.test(filePath)
+  );
+}
+
+/**
+ * Verifies that test files covering @spec:REQ-XX actually import local source modules,
+ * define real test cases, and use substantive assertions (not empty stubs).
+ */
+export function verifyTestSubstance(
+  files: GateSourceFile[],
+  reqIds: string[],
+  targetTestFiles: string[] = []
+): string[] {
+  const errors: string[] = [];
+  const testFiles = files.filter((f) => f.isTest || isTestFilePath(f.path));
+  if (testFiles.length === 0) {
+    return ['No test files found in repository'];
+  }
+
+  const substantiveAssertionRe =
+    /\b(?:assert\.(?:equal|deepEqual|strictEqual|notEqual|throws|rejects|doesNotThrow|doesNotReject|match|ok)\(|expect\(|self\.assert(?:Equal|True|False|Raises|In|IsNotNone)|t\.(?:Error|Fatal|Errorf|Fatalf)|assertEquals|assertTrue|assertFalse|assertThrows)\b/;
+  const trivialOnlyRe = /^\s*assert(?:\.ok)?\s*\(\s*(?:true|1)\s*\)\s*;?\s*$/;
+
+  const targetTestSet = new Set(targetTestFiles);
+  const candidateTests =
+    targetTestSet.size > 0
+      ? testFiles.filter((f) => targetTestSet.has(f.path))
+      : testFiles;
+
+  const reqTestFiles = candidateTests.filter((f) =>
+    reqIds.some((reqId) => f.content.includes(`@spec:${reqId}`) || f.content.includes(reqId))
+  );
+
+  if (reqIds.length > 0 && reqTestFiles.length === 0) {
+    errors.push(
+      targetTestSet.size > 0
+        ? `Target test file(s) (${Array.from(targetTestSet).join(', ')}) missing or do not cover any REQ-XX`
+        : 'No test file covers any REQ-XX from the OpenSpec change'
+    );
+    return errors;
+  }
+
+  for (const tf of reqTestFiles) {
+    const lines = tf.content.split(/\r?\n/);
+    const hasLocalImport =
+      /from\s+['"]\.\.?\/.*src\/|from\s+src\.|import\s+src\./.test(tf.content) ||
+      /from\s+['"]\.\.?\//.test(tf.content);
+    const hasTestBlock =
+      /\b(?:test|it)\s*\(|def\s+test_|func\s+Test|@Test\b/.test(tf.content);
+    const substantiveLines = lines.filter(
+      (l) => substantiveAssertionRe.test(l) && !trivialOnlyRe.test(l)
+    );
+
+    if (!hasLocalImport) {
+      errors.push(`${tf.path}: missing import of implementation module under src/`);
+    }
+    if (!hasTestBlock) {
+      errors.push(`${tf.path}: missing test(...) / def test_... block`);
+    }
+    if (substantiveLines.length === 0) {
+      errors.push(`${tf.path}: contains no substantive assertions verifying implementation behavior`);
+    }
+  }
+
+  return errors;
 }
 
 export function runPreReviewGate(input: GateExecutionInput): PreReviewGateResult {
@@ -44,22 +118,56 @@ export function runPreReviewGate(input: GateExecutionInput): PreReviewGateResult
   const uncheckedTasks = graph.tasks.filter((t) => !t.completed).map((t) => t.id);
   const tasksCheckPassed = uncheckedTasks.length === 0;
 
-  // 2. Check @spec:REQ-XX markers in code & tests
-  const codeFiles = input.files.filter((f) => !f.isTest && !f.path.includes('test'));
-  const testFiles = input.files.filter((f) => f.isTest || f.path.includes('test'));
+  // 2. Check @spec:REQ-XX markers in code & tests (scoped to task target files when declared)
+  const codeFiles = input.files.filter((f) => !f.isTest && !isTestFilePath(f.path));
+  const testFiles = input.files.filter((f) => f.isTest || isTestFilePath(f.path));
 
-  const codeCorpus = codeFiles.map((f) => f.content).join('\n');
-  const testCorpus = testFiles.map((f) => f.content).join('\n');
+  const reqToCodeTargets = new Map<string, Set<string>>();
+  const reqToTestTargets = new Map<string, Set<string>>();
+  const allTargetTests = new Set<string>();
+
+  for (const t of graph.tasks) {
+    for (const target of t.targetFiles) {
+      const isTestTarget = isTestFilePath(target);
+      if (isTestTarget) allTargetTests.add(target);
+      for (const reqId of t.linkedReqs) {
+        const map = isTestTarget ? reqToTestTargets : reqToCodeTargets;
+        if (!map.has(reqId)) map.set(reqId, new Set());
+        map.get(reqId)!.add(target);
+      }
+    }
+  }
+
+  const fullCodeCorpus = codeFiles.map((f) => f.content).join('\n');
+  const fullTestCorpus = testFiles.map((f) => f.content).join('\n');
 
   const uncoveredReqsInCode: string[] = [];
   const uncoveredReqsInTests: string[] = [];
 
   for (const req of graph.requirements) {
     const marker = `@spec:${req.id}`;
-    if (!codeCorpus.includes(marker) && !codeCorpus.includes(req.id)) {
+
+    const declaredCodeTargets = reqToCodeTargets.get(req.id);
+    const scopedCodeCorpus =
+      declaredCodeTargets && declaredCodeTargets.size > 0
+        ? codeFiles
+            .filter((f) => declaredCodeTargets.has(f.path))
+            .map((f) => f.content)
+            .join('\n')
+        : fullCodeCorpus;
+    if (!scopedCodeCorpus.includes(marker) && !scopedCodeCorpus.includes(req.id)) {
       uncoveredReqsInCode.push(req.id);
     }
-    if (!testCorpus.includes(marker) && !testCorpus.includes(req.id)) {
+
+    const declaredTestTargets = reqToTestTargets.get(req.id);
+    const scopedTestCorpus =
+      declaredTestTargets && declaredTestTargets.size > 0
+        ? testFiles
+            .filter((f) => declaredTestTargets.has(f.path))
+            .map((f) => f.content)
+            .join('\n')
+        : fullTestCorpus;
+    if (!scopedTestCorpus.includes(marker) && !scopedTestCorpus.includes(req.id)) {
       uncoveredReqsInTests.push(req.id);
     }
   }
@@ -102,8 +210,15 @@ export function runPreReviewGate(input: GateExecutionInput): PreReviewGateResult
 
   const consistencyPassed = consistencyErrors.length === 0;
 
-  // 4. Test runner check
-  const testsPassed = input.testsPassing;
+  // 4. Test runner check & optional substance check
+  const substanceErrors = input.verifySubstance
+    ? verifyTestSubstance(
+        input.files,
+        graph.requirements.map((r) => r.id),
+        Array.from(allTargetTests)
+      )
+    : [];
+  const testsPassed = input.testsPassing && substanceErrors.length === 0;
 
   // 5. Linter / typecheck check
   const lintPassed = input.lintErrors.length === 0;
@@ -151,7 +266,12 @@ export function runPreReviewGate(input: GateExecutionInput): PreReviewGateResult
       passed: testsPassed,
       details: testsPassed
         ? '100% unit & integration тестов зелёные'
-        : input.failingTestSnippet || 'Обнаружены падения тестов',
+        : [
+            !input.testsPassing ? input.failingTestSnippet || 'Обнаружены падения тестов' : '',
+            ...substanceErrors,
+          ]
+            .filter(Boolean)
+            .join('; '),
       tokensUsed: 0,
     },
     {
@@ -189,6 +309,7 @@ export function runPreReviewGate(input: GateExecutionInput): PreReviewGateResult
     uncoveredReqsInTests,
     uncheckedTasks,
     consistencyErrors,
+    substanceErrors,
     conciseReport,
     reportTokens: estimateTokens(conciseReport),
   };
