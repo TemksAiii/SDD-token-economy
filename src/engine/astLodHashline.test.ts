@@ -6,7 +6,7 @@ import {
   formatWithHashlines,
   renderAstLodView,
 } from './astLodHashline';
-import { DEMO_SAMPLE_PYTHON_FILE } from '../data/demoWorkspace';
+import { DEMO_SAMPLE_PYTHON_FILE } from '../data/demoFixtures';
 
 test('formatWithHashlines prefixes every line with L{n}#{hash3}', () => {
   const { lines } = formatWithHashlines('alpha\nbeta');

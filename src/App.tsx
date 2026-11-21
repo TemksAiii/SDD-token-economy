@@ -3,18 +3,23 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import {
-  AbBenchmarkResult,
-  BenchmarkConfig,
-  DEFAULT_BENCHMARK_CONFIG,
-  runAbBenchmark,
-} from './engine/abBenchmark';
-import { generateJuryDeliverables, JuryDeliverablesBundle } from './engine/juryDeliverables';
+  buildKvCacheLayout,
+  DEFAULT_SIMULATION_CONFIG,
+  runLocalSimulation,
+  SimulationConfig,
+} from './engine/abModelSimulation';
+import { generateJuryDeliverables } from './engine/juryDeliverables';
 import { OverviewBenchmarkView } from './components/OverviewBenchmarkView';
 import { ModuleSandboxView } from './components/ModuleSandboxView';
 import { PortabilityView } from './components/PortabilityView';
 import { JuryReportView } from './components/JuryReportView';
+import {
+  ActiveBenchmarkState,
+  LiveRunProgressEvent,
+  WorkbenchStatusResponse,
+} from './types/workbench';
 
 type AppPage = 'overview' | 'modules' | 'portability' | 'report';
 
@@ -24,44 +29,221 @@ export default function App() {
     setActivePage(page);
     window.scrollTo({ top: 0 });
   }, []);
-  const [config, setConfig] = useState<BenchmarkConfig>(DEFAULT_BENCHMARK_CONFIG);
-  const [serverResult, setServerResult] = useState<{
-    benchmark: AbBenchmarkResult;
-    deliverables: JuryDeliverablesBundle;
-  } | null>(null);
-  const [isRunning, setIsRunning] = useState<boolean>(false);
 
-  const localComputed = useMemo(() => {
-    const benchmark = runAbBenchmark(config);
-    const deliverables = generateJuryDeliverables(benchmark);
-    return { benchmark, deliverables };
-  }, [config]);
+  const [status, setStatus] = useState<WorkbenchStatusResponse | null>(null);
+  const [statusLoading, setStatusLoading] = useState<boolean>(true);
 
-  const activeData = serverResult ?? localComputed;
+  const [selectedRepoPath, setSelectedRepoPath] = useState<string>('benchmarks/orders-ts');
+  const [selectedChangeId, setSelectedChangeId] = useState<string>('add-idempotency-and-webhooks');
+  const [selectedModel, setSelectedModel] = useState<string>('gemini-4-hydrogen');
+  const [selectedProvider, setSelectedProvider] = useState<'gemini' | 'openai_compat' | undefined>(
+    undefined
+  );
+  const [maxReviewIters, setMaxReviewIters] = useState<number>(3);
 
-  const handleUpdateConfig = useCallback((patch: Partial<BenchmarkConfig>) => {
-    setServerResult(null);
-    setConfig((prev) => ({ ...prev, ...patch }));
-  }, []);
+  const [simConfig, setSimConfig] = useState<SimulationConfig>(DEFAULT_SIMULATION_CONFIG);
+  const [measuredState, setMeasuredState] = useState<ActiveBenchmarkState | null>(null);
+  const [viewMode, setViewMode] = useState<'measured' | 'simulated'>('simulated');
 
-  const handleRunServerBenchmark = useCallback(async () => {
-    setIsRunning(true);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [isRunningReal, setIsRunningReal] = useState<boolean>(false);
+  const [liveEvents, setLiveEvents] = useState<LiveRunProgressEvent[]>([]);
+  const [runError, setRunError] = useState<string | null>(null);
+  const eventSourceRef = useRef<EventSource | null>(null);
+
+  const refreshStatus = useCallback(async () => {
     try {
-      const resp = await fetch('/api/benchmark', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(config),
-      });
-      if (resp.ok) {
-        const data = await resp.json();
-        if (data.benchmark && data.deliverables) {
-          setServerResult(data);
+      const resp = await fetch('/api/status');
+      if (!resp.ok) return;
+      const data = (await resp.json()) as WorkbenchStatusResponse;
+      setStatus(data);
+      if (data.provider.availableModels.length > 0) {
+        const first = data.provider.availableModels[0];
+        setSelectedModel((prev) =>
+          data.provider.availableModels.some((m) => m.id === prev) ? prev : first.id
+        );
+        setSelectedProvider(first.provider);
+      }
+      if (data.savedRuns.length > 0 && !measuredState) {
+        try {
+          const runResp = await fetch(`/api/runs/${encodeURIComponent(data.savedRuns[0].runId)}`);
+          if (runResp.ok) {
+            const runData = await runResp.json();
+            if (runData.report && runData.deliverables) {
+              setMeasuredState({
+                report: runData.report,
+                deliverables: runData.deliverables,
+                kvCacheLayout: buildKvCacheLayout(true),
+              });
+              setViewMode('measured');
+            }
+          }
+        } catch {
+          // ignore error loading previous run
         }
       }
     } finally {
-      setIsRunning(false);
+      setStatusLoading(false);
     }
-  }, [config]);
+  }, [measuredState]);
+
+  useEffect(() => {
+    void refreshStatus();
+    return () => {
+      eventSourceRef.current?.close();
+    };
+  }, []);
+
+  const simulatedState = useMemo<ActiveBenchmarkState>(() => {
+    const report = runLocalSimulation(simConfig);
+    const deliverables = generateJuryDeliverables(report);
+    const kvCacheLayout = buildKvCacheLayout(simConfig.enableDeltaReviewAndCache);
+    return { report, deliverables, kvCacheLayout };
+  }, [simConfig]);
+
+  const activeData =
+    viewMode === 'measured' && measuredState ? measuredState : simulatedState;
+
+  const handleUpdateSimConfig = useCallback((patch: Partial<SimulationConfig>) => {
+    setSimConfig((prev) => ({ ...prev, ...patch }));
+  }, []);
+
+  const handleRunServerSimulation = useCallback(async () => {
+    setRunError(null);
+    const resp = await fetch('/api/simulation', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(simConfig),
+    });
+    if (resp.ok) {
+      setViewMode('simulated');
+    }
+  }, [simConfig]);
+
+  const handleLoadSavedRun = useCallback(async (runId: string) => {
+    setRunError(null);
+    const resp = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
+    if (!resp.ok) {
+      const errData = await resp.json().catch(() => ({}));
+      setRunError(errData.error || 'Не удалось загрузить сохранённый прогон');
+      return;
+    }
+    const data = await resp.json();
+    setMeasuredState({
+      report: data.report,
+      deliverables: data.deliverables,
+      kvCacheLayout: buildKvCacheLayout(true),
+    });
+    setViewMode('measured');
+  }, []);
+
+  const handleStartRealAbRun = useCallback(async () => {
+    setRunError(null);
+    setLiveEvents([]);
+    eventSourceRef.current?.close();
+
+    setIsRunningReal(true);
+    try {
+      const resp = await fetch('/api/runs/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          repoPath: selectedRepoPath,
+          changeId: selectedChangeId,
+          provider: selectedProvider,
+          model: selectedModel,
+          maxReviewIters,
+        }),
+      });
+
+      const payload = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        setRunError(
+          payload.error || 'Не удалось запустить реальный A/B прогон через worktree.'
+        );
+        setIsRunningReal(false);
+        return;
+      }
+
+      const jobId: string = payload.jobId;
+      setActiveJobId(jobId);
+
+      const es = new EventSource(`/api/runs/jobs/${encodeURIComponent(jobId)}/stream`);
+      eventSourceRef.current = es;
+
+      es.addEventListener('progress', (ev) => {
+        try {
+          const parsed = JSON.parse((ev as MessageEvent).data) as LiveRunProgressEvent;
+          setLiveEvents((prev) => [...prev, parsed]);
+        } catch {
+          // ignore malformed SSE progress frame
+        }
+      });
+
+      es.addEventListener('completed', (ev) => {
+        try {
+          const data = JSON.parse((ev as MessageEvent).data);
+          if (data.report && data.deliverables) {
+            setMeasuredState({
+              report: data.report,
+              deliverables: data.deliverables,
+              kvCacheLayout: buildKvCacheLayout(true),
+            });
+            setViewMode('measured');
+          }
+        } finally {
+          es.close();
+          setIsRunningReal(false);
+          setActiveJobId(null);
+          void refreshStatus();
+        }
+      });
+
+      es.addEventListener('cancelled', (ev) => {
+        try {
+          const data = JSON.parse((ev as MessageEvent).data);
+          setRunError(data.error || 'Прогон отменён пользователем.');
+        } finally {
+          es.close();
+          setIsRunningReal(false);
+          setActiveJobId(null);
+        }
+      });
+
+      es.addEventListener('error', (ev) => {
+        try {
+          const msgEvent = ev as MessageEvent;
+          if (msgEvent.data) {
+            const data = JSON.parse(msgEvent.data);
+            setRunError(data.error || 'Ошибка выполнения реального A/B прогона.');
+          }
+        } catch {
+          setRunError('Поток выполнения прогона прервался.');
+        } finally {
+          es.close();
+          setIsRunningReal(false);
+          setActiveJobId(null);
+        }
+      });
+    } catch (err) {
+      setRunError(err instanceof Error ? err.message : 'Сетевая ошибка при запуске A/B');
+      setIsRunningReal(false);
+    }
+  }, [
+    selectedRepoPath,
+    selectedChangeId,
+    selectedProvider,
+    selectedModel,
+    maxReviewIters,
+    refreshStatus,
+  ]);
+
+  const handleCancelRealAbRun = useCallback(async () => {
+    if (!activeJobId) return;
+    await fetch(`/api/runs/jobs/${encodeURIComponent(activeJobId)}/cancel`, {
+      method: 'POST',
+    });
+  }, [activeJobId]);
 
   const navItems: Array<{ id: AppPage; label: string }> = [
     { id: 'overview', label: 'Обзор A/B' },
@@ -75,7 +257,6 @@ export default function App() {
       {/* Strict 3-Zone Top Bar Contract */}
       <header className="sticky top-0 z-30 bg-white/95 backdrop-blur-xs border-b border-slate-200">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-8">
-          {/* Zone 1: Single-line wordmark */}
           <button
             type="button"
             onClick={() => navigateTo('overview')}
@@ -84,7 +265,6 @@ export default function App() {
             SpecTrim
           </button>
 
-          {/* Zone 2: 4 concise single-line text nav links */}
           <nav
             aria-label="Основная навигация"
             className="hidden md:flex items-center gap-6 text-sm font-medium"
@@ -108,18 +288,17 @@ export default function App() {
             })}
           </nav>
 
-          {/* Zone 3: 1 primary CTA */}
           <div className="flex items-center shrink-0">
             <button
               type="button"
               onClick={() => {
                 navigateTo('overview');
-                void handleRunServerBenchmark();
+                void handleStartRealAbRun();
               }}
-              disabled={isRunning}
+              disabled={isRunningReal}
               className="px-4 py-2 text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0"
             >
-              {isRunning ? 'Запуск...' : 'Запустить A/B прогон'}
+              {isRunningReal ? 'Выполняется A/B...' : 'Запустить A/B прогон'}
             </button>
           </div>
         </div>
@@ -149,28 +328,56 @@ export default function App() {
         </nav>
       </header>
 
-      {/* Main Content Viewport */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-8">
         {activePage === 'overview' && (
           <OverviewBenchmarkView
-            benchmark={activeData.benchmark}
-            config={config}
-            onUpdateConfig={handleUpdateConfig}
-            onRunBenchmark={handleRunServerBenchmark}
-            isRunning={isRunning}
+            activeData={activeData}
+            viewMode={viewMode}
+            onChangeViewMode={setViewMode}
+            hasMeasuredRun={Boolean(measuredState)}
+            simConfig={simConfig}
+            onUpdateSimConfig={handleUpdateSimConfig}
+            onRunServerSimulation={handleRunServerSimulation}
+            status={status}
+            statusLoading={statusLoading}
+            selectedRepoPath={selectedRepoPath}
+            onChangeRepoPath={(repo) => {
+              setSelectedRepoPath(repo);
+              const repoInfo = status?.repos.find((r) => r.repoPath === repo);
+              if (repoInfo && repoInfo.changes.length > 0) {
+                const pendingPrefer =
+                  repoInfo.changes.find((c) => c.includes('idempotency')) ?? repoInfo.changes[0];
+                setSelectedChangeId(pendingPrefer);
+              }
+            }}
+            selectedChangeId={selectedChangeId}
+            onChangeChangeId={setSelectedChangeId}
+            selectedModel={selectedModel}
+            onChangeModel={(modelId) => {
+              setSelectedModel(modelId);
+              const found = status?.provider.availableModels.find((m) => m.id === modelId);
+              if (found) setSelectedProvider(found.provider);
+            }}
+            maxReviewIters={maxReviewIters}
+            onChangeMaxReviewIters={setMaxReviewIters}
+            isRunningReal={isRunningReal}
+            onStartRealRun={handleStartRealAbRun}
+            onCancelRealRun={handleCancelRealAbRun}
+            liveEvents={liveEvents}
+            runError={runError}
+            onLoadSavedRun={handleLoadSavedRun}
           />
         )}
-        {activePage === 'modules' && <ModuleSandboxView />}
+        {activePage === 'modules' && <ModuleSandboxView repos={status?.repos ?? []} />}
         {activePage === 'portability' && <PortabilityView />}
         {activePage === 'report' && (
           <JuryReportView
+            report={activeData.report}
             deliverables={activeData.deliverables}
-            metricsJsonl={activeData.benchmark.metricsJsonl}
           />
         )}
       </main>
 
-      {/* Clean Quiet Footer */}
       <footer className="border-t border-slate-200 bg-white">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500">
           <span>SpecTrim SDD Token Optimization Workbench</span>

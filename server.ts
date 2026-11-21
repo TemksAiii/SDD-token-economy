@@ -1,27 +1,63 @@
 import express from 'express';
-import path from 'path';
-import fs from 'fs';
+import path from 'node:path';
+import fs from 'node:fs';
 import { createServer as createViteServer } from 'vite';
-import { runAbBenchmark } from './src/engine/abBenchmark';
-import { sliceSpecForTask, parseOpenSpecBundle } from './src/engine/specSlicer';
+import {
+  buildKvCacheLayout,
+  runLocalSimulation,
+} from './src/engine/abModelSimulation';
+import { parseOpenSpecBundle, sliceSpecForTask } from './src/engine/specSlicer';
 import {
   applyHashlinePatch,
+  LodLevel,
   renderAstLodView,
   SupportedLanguage,
-  LodLevel,
 } from './src/engine/astLodHashline';
-import { compressGitDiff, compressTestLog, TestRunnerKind } from './src/engine/outputCompressor';
-import { runPreReviewGate } from './src/engine/preReviewGate';
-import { analyzeRepoPortability } from './src/engine/portability';
-import { generateJuryDeliverables } from './src/engine/juryDeliverables';
 import {
-  DEMO_GATE_FILES,
-  DEMO_KNOWN_CONTRACTS,
-  DEMO_OPENSPEC_BUNDLE,
-  DEMO_REPO_PROBES,
-} from './src/data/demoWorkspace';
+  compressGitDiff,
+  compressTestLog,
+  TestRunnerKind,
+} from './src/engine/outputCompressor';
+import { runPreReviewGate } from './src/engine/preReviewGate';
+import { generateJuryDeliverables } from './src/engine/juryDeliverables';
+import { AbRunReport } from './src/engine/provenance';
+import {
+  collectRepoFiles,
+  detectRepoOnDisk,
+  getRealRepoPortabilityDetails,
+  listRepoFilesMeta,
+  listWorkspaceBenchmarkRepos,
+  readOpenSpecBundleFromDisk,
+  readRepoFile,
+} from './src/runtime/repoFs';
+import { runLocalPreReviewGate } from './src/runtime/localGateRunner';
+import { getProviderStatus } from './src/runtime/llmProvider';
+import {
+  BenchmarkProgressEvent,
+  listSavedRuns,
+  loadSavedRun,
+  runRealAbWorktreeBenchmark,
+} from './src/runtime/abWorktreeRunner';
+import { resolveConfinedPath } from './src/runtime/pathGuard';
 
 const PORT = 3000;
+
+interface ActiveRunJob {
+  jobId: string;
+  controller: AbortController;
+  status: 'running' | 'completed' | 'cancelled' | 'failed';
+  events: BenchmarkProgressEvent[];
+  report?: AbRunReport;
+  error?: string;
+  subscribers: Set<express.Response>;
+}
+
+const activeJobs = new Map<string, ActiveRunJob>();
+
+function sendSse(res: express.Response, eventName: string, payload: unknown): void {
+  res.write(`event: ${eventName}\n`);
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
 
 async function startServer() {
   const app = express();
@@ -31,53 +67,156 @@ async function startServer() {
     res.json({ status: 'ok', service: 'spectrim-sdd-workbench' });
   });
 
-  app.post('/api/benchmark', (req, res) => {
+  // Provider readiness + real disk repositories + saved runs
+  app.get('/api/status', (_req, res) => {
     try {
-      const benchmark = runAbBenchmark(req.body ?? {});
-      const deliverables = generateJuryDeliverables(benchmark);
-      res.json({ benchmark, deliverables });
+      res.json({
+        provider: getProviderStatus(),
+        repos: listWorkspaceBenchmarkRepos(),
+        savedRuns: listSavedRuns(),
+      });
     } catch (err) {
-      res.status(400).json({ error: err instanceof Error ? err.message : 'Benchmark failed' });
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to inspect workspace status',
+      });
     }
   });
 
-  app.post('/api/slice', (req, res) => {
+  // Local mathematical simulation (strictly tagged provenance: 'simulated')
+  app.post('/api/simulation', (req, res) => {
     try {
-      const {
-        taskId = 'TSK-07',
-        completedTaskIds = ['TSK-01', 'TSK-02', 'TSK-03', 'TSK-04', 'TSK-05', 'TSK-06'],
-        bundle = DEMO_OPENSPEC_BUNDLE,
-      } = req.body ?? {};
+      const cfg = req.body ?? {};
+      const report = runLocalSimulation(cfg);
+      const deliverables = generateJuryDeliverables(report);
+      const kvCacheLayout = buildKvCacheLayout(
+        cfg.enableDeltaReviewAndCache !== false
+      );
+      res.json({ report, deliverables, kvCacheLayout });
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Simulation failed',
+      });
+    }
+  });
+
+  // Real disk portability scan across all benchmark repositories
+  app.get('/api/fs/portability', (_req, res) => {
+    try {
+      const repos = listWorkspaceBenchmarkRepos();
+      const details = repos.map((r) => getRealRepoPortabilityDetails(r.repoPath));
+      res.json({ repos: details, provenance: 'measured_local' });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Portability scan failed',
+      });
+    }
+  });
+
+  // Real disk OpenSpec repository inspection
+  app.get('/api/fs/inspect', (req, res) => {
+    try {
+      const repoPath = String(req.query.repo || 'benchmarks/orders-ts');
+      const repo = detectRepoOnDisk(repoPath);
+      const changeId = String(
+        req.query.change || repo.changes[0] || 'add-rate-limit-and-audit'
+      );
+      const bundle = readOpenSpecBundleFromDisk(repoPath, changeId);
       const graph = parseOpenSpecBundle(bundle);
-      const slice = sliceSpecForTask(bundle, taskId, completedTaskIds, DEMO_KNOWN_CONTRACTS);
-      res.json({ graph, slice });
+      const files = listRepoFilesMeta(repoPath);
+      res.json({
+        repo,
+        bundle,
+        graph,
+        files,
+        provenance: 'measured_local',
+      });
     } catch (err) {
-      res.status(400).json({ error: err instanceof Error ? err.message : 'Slice failed' });
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Failed to inspect repository',
+      });
     }
   });
 
-  app.post('/api/ast-lod', (req, res) => {
+  // Task-scoped OpenSpec slicing on real disk bundle
+  app.post('/api/fs/slice', (req, res) => {
     try {
       const {
-        filePath = 'src/middleware/rate_limiter.py',
-        content = '',
-        language = 'python',
-        level = 'LOD1',
-        repoTreePaths = [],
+        repoPath = 'benchmarks/orders-ts',
+        changeId = 'add-rate-limit-and-audit',
+        taskId = 'TSK-01',
+        completedTaskIds,
       } = req.body ?? {};
-      const view = renderAstLodView(
+      const bundle = readOpenSpecBundleFromDisk(repoPath, changeId);
+      const graph = parseOpenSpecBundle(bundle);
+      const idx = graph.tasks.findIndex((t) => t.id === taskId);
+      const derivedCompleted = Array.isArray(completedTaskIds)
+        ? completedTaskIds
+        : graph.tasks.slice(0, Math.max(0, idx)).map((t) => t.id);
+
+      const contracts = graph.tasks.slice(0, Math.max(0, idx)).map((t) => ({
+        taskId: t.id,
+        file: t.targetFiles[0] || 'src/',
+        symbol: t.title.slice(0, 60),
+        reqs: t.linkedReqs,
+      }));
+
+      const slice = sliceSpecForTask(bundle, taskId, derivedCompleted, contracts);
+      res.json({ graph, slice, provenance: 'measured_local' });
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Slice failed',
+      });
+    }
+  });
+
+  // Real AST-LOD & Hashline reading from disk repository
+  app.post('/api/fs/ast-lod', (req, res) => {
+    try {
+      const {
+        repoPath = 'benchmarks/orders-ts',
         filePath,
         content,
-        language as SupportedLanguage,
+        language,
+        level = 'LOD1',
+      } = req.body ?? {};
+      const repo = detectRepoOnDisk(repoPath);
+      const filesMeta = listRepoFilesMeta(repoPath);
+      const resolvedFilePath =
+        typeof filePath === 'string' && filePath.length > 0
+          ? filePath
+          : filesMeta.find((f) => !f.isTest)?.path || filesMeta[0]?.path || '';
+
+      const actualContent =
+        typeof content === 'string'
+          ? content
+          : resolvedFilePath
+          ? readRepoFile(repoPath, resolvedFilePath)
+          : '';
+
+      const view = renderAstLodView(
+        resolvedFilePath,
+        actualContent,
+        (language || repo.language) as SupportedLanguage,
         level as LodLevel,
-        repoTreePaths
+        filesMeta.map((f) => f.path)
       );
-      res.json(view);
+
+      res.json({
+        filePath: resolvedFilePath,
+        language: language || repo.language,
+        rawContent: actualContent,
+        view,
+        files: filesMeta,
+        provenance: 'measured_local',
+      });
     } catch (err) {
-      res.status(400).json({ error: err instanceof Error ? err.message : 'AST-LOD failed' });
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'AST-LOD inspection failed',
+      });
     }
   });
 
+  // Hashline patch validator (in-memory verification without mutating benchmark git HEAD)
   app.post('/api/hashline-patch', (req, res) => {
     try {
       const { content, patch } = req.body ?? {};
@@ -87,78 +226,262 @@ async function startServer() {
       const result = applyHashlinePatch(content, patch);
       res.json(result);
     } catch (err) {
-      res.status(400).json({ error: err instanceof Error ? err.message : 'Patch failed' });
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Patch failed',
+      });
     }
   });
 
+  // Deterministic test log / git diff compressor
   app.post('/api/compress', (req, res) => {
     try {
-      const { kind = 'test_log', raw = '', runner = 'pytest', unchangedHashes = {} } = req.body ?? {};
+      const {
+        kind = 'test_log',
+        raw = '',
+        runner = 'pytest',
+        unchangedHashes = {},
+      } = req.body ?? {};
       const result =
         kind === 'git_diff'
           ? compressGitDiff(raw, unchangedHashes)
           : compressTestLog(raw, runner as TestRunnerKind);
       res.json(result);
     } catch (err) {
-      res.status(400).json({ error: err instanceof Error ? err.message : 'Compress failed' });
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Compress failed',
+      });
     }
   });
 
-  app.post('/api/gate', (req, res) => {
+  // Real Zero-Token Pre-Review Gate running actual test + lint commands on disk
+  app.post('/api/fs/gate', async (req, res) => {
     try {
       const {
-        missingReqTest = false,
-        uncheckedTask = false,
-        failingTest = false,
-        lintError = false,
-        brokenDesignRef = false,
+        repoPath = 'benchmarks/orders-ts',
+        changeId = 'add-rate-limit-and-audit',
+        injectDefects = {},
       } = req.body ?? {};
 
-      let bundle = { ...DEMO_OPENSPEC_BUNDLE };
-      if (uncheckedTask) {
-        bundle = {
-          ...bundle,
-          tasksMd: bundle.tasksMd.replace('- [x] [TSK-07]', '- [ ] [TSK-07]'),
-        };
-      }
-      if (brokenDesignRef) {
-        bundle = {
-          ...bundle,
-          designMd: bundle.designMd.replace('Linked requirements: REQ-09', 'Linked requirements: REQ-99'),
-        };
+      const hasSimulatedDefects = Boolean(
+        injectDefects?.missingReqTest ||
+          injectDefects?.uncheckedTask ||
+          injectDefects?.failingTest ||
+          injectDefects?.lintError ||
+          injectDefects?.brokenDesignRef
+      );
+
+      if (!hasSimulatedDefects) {
+        const realGate = await runLocalPreReviewGate(repoPath, changeId);
+        return res.json({
+          ...realGate,
+          defectsInjected: false,
+        });
       }
 
-      const files = DEMO_GATE_FILES.map((f) => {
-        if (missingReqTest && f.isTest) {
-          return { ...f, content: f.content.replace('@spec:REQ-07', '') };
-        }
-        return f;
-      });
+      // If sandbox defect injection toggles are enabled, run real disk checks first,
+      // then apply the requested in-memory defect perturbation transparently.
+      const absRepo = resolveConfinedPath(repoPath);
+      const realBaseline = await runLocalPreReviewGate(repoPath, changeId);
+      let bundle = readOpenSpecBundleFromDisk(repoPath, changeId);
+      let files = collectRepoFiles(absRepo);
+
+      if (injectDefects.uncheckedTask) {
+        bundle = {
+          ...bundle,
+          tasksMd: bundle.tasksMd.replace(/^- \[x\] /m, '- [ ] '),
+        };
+      }
+      if (injectDefects.brokenDesignRef) {
+        bundle = {
+          ...bundle,
+          designMd: `${bundle.designMd}\n\nLinked requirements: REQ-99\n`,
+        };
+      }
+      if (injectDefects.missingReqTest) {
+        files = files.map((f) =>
+          f.isTest
+            ? { ...f, content: f.content.replace(/@spec:REQ-\d+/g, '') }
+            : f
+        );
+      }
 
       const gate = runPreReviewGate({
         bundle,
         files,
-        testsPassing: !failingTest,
-        failingTestSnippet: failingTest
-          ? 'FAILED tests/test_rate_limit_audit.py::test_spool_fallback_on_sink_error - AssertionError: assert False'
-          : undefined,
-        lintErrors: lintError
-          ? ['src/audit/audit_logger.py:42:5: F401 unused import json']
-          : [],
+        testsPassing: !injectDefects.failingTest && realBaseline.testExitCode === 0,
+        failingTestSnippet: injectDefects.failingTest
+          ? 'Simulated assertion failure injected via Sandbox defect toggle'
+          : realBaseline.testExitCode === 0
+          ? undefined
+          : realBaseline.compressedTestLog.compressed,
+        lintErrors: injectDefects.lintError
+          ? ['Simulated lint violation injected via Sandbox defect toggle']
+          : realBaseline.lintExitCode === 0
+          ? []
+          : [realBaseline.rawLintOutput.slice(0, 300)],
       });
 
-      res.json(gate);
+      return res.json({
+        ...realBaseline,
+        gate,
+        defectsInjected: true,
+      });
     } catch (err) {
-      res.status(400).json({ error: err instanceof Error ? err.message : 'Gate check failed' });
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Local Pre-Review Gate failed',
+      });
     }
   });
 
-  app.get('/api/portability', (_req, res) => {
-    const probes = DEMO_REPO_PROBES.map((probe) => ({
-      probe,
-      analysis: analyzeRepoPortability(probe),
-    }));
-    res.json({ probes });
+  // Saved A/B benchmark runs from .spectrim-runs/
+  app.get('/api/runs', (_req, res) => {
+    try {
+      res.json({ runs: listSavedRuns() });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to list saved runs',
+      });
+    }
+  });
+
+  app.get('/api/runs/:runId', (req, res) => {
+    try {
+      const report = loadSavedRun(req.params.runId);
+      const deliverables = generateJuryDeliverables(report);
+      res.json({ report, deliverables });
+    } catch (err) {
+      res.status(404).json({
+        error: err instanceof Error ? err.message : 'Run not found',
+      });
+    }
+  });
+
+  // Start real isolated git worktree A/B benchmark with AbortController + SSE progress
+  app.post('/api/runs/start', (req, res) => {
+    try {
+      const {
+        repoPath = 'benchmarks/orders-ts',
+        changeId = 'add-idempotency-and-webhooks',
+        provider,
+        model,
+        maxReviewIters = 3,
+      } = req.body ?? {};
+
+      const status = getProviderStatus();
+      if (status.defaultProvider === 'none') {
+        return res.status(400).json({
+          code: 'PROVIDER_NOT_CONFIGURED',
+          error: status.limitationNote,
+        });
+      }
+
+      // Validate repository & OpenSpec change upfront before spawning background run
+      const repoInfo = detectRepoOnDisk(repoPath);
+      if (!repoInfo.isGitRepo) {
+        return res.status(400).json({
+          error: `Репозиторий ${repoInfo.repoPath} не является git-репозиторием; git worktree невозможен.`,
+        });
+      }
+      readOpenSpecBundleFromDisk(repoPath, changeId);
+
+      const jobId = `job-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const controller = new AbortController();
+      const job: ActiveRunJob = {
+        jobId,
+        controller,
+        status: 'running',
+        events: [],
+        subscribers: new Set(),
+      };
+      activeJobs.set(jobId, job);
+
+      void runRealAbWorktreeBenchmark({
+        repoPath,
+        changeId,
+        provider,
+        model,
+        maxReviewIters,
+        signal: controller.signal,
+        onProgress: (ev) => {
+          job.events.push(ev);
+          for (const sub of job.subscribers) {
+            sendSse(sub, 'progress', ev);
+          }
+        },
+      })
+        .then((report) => {
+          job.status = 'completed';
+          job.report = report;
+          const deliverables = generateJuryDeliverables(report);
+          for (const sub of job.subscribers) {
+            sendSse(sub, 'completed', { report, deliverables });
+            sub.end();
+          }
+          job.subscribers.clear();
+        })
+        .catch((err) => {
+          const aborted = controller.signal.aborted;
+          job.status = aborted ? 'cancelled' : 'failed';
+          job.error = err instanceof Error ? err.message : String(err);
+          for (const sub of job.subscribers) {
+            sendSse(sub, aborted ? 'cancelled' : 'error', { error: job.error });
+            sub.end();
+          }
+          job.subscribers.clear();
+        });
+
+      return res.status(202).json({ jobId });
+    } catch (err) {
+      return res.status(400).json({
+        error: err instanceof Error ? err.message : 'Failed to start benchmark',
+      });
+    }
+  });
+
+  app.get('/api/runs/jobs/:jobId/stream', (req, res) => {
+    const job = activeJobs.get(req.params.jobId);
+    if (!job) {
+      return res.status(404).json({ error: 'Benchmark job not found' });
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    for (const ev of job.events) {
+      sendSse(res, 'progress', ev);
+    }
+
+    if (job.status === 'completed' && job.report) {
+      sendSse(res, 'completed', {
+        report: job.report,
+        deliverables: generateJuryDeliverables(job.report),
+      });
+      return res.end();
+    }
+    if (job.status === 'cancelled') {
+      sendSse(res, 'cancelled', { error: job.error || 'Cancelled by user' });
+      return res.end();
+    }
+    if (job.status === 'failed') {
+      sendSse(res, 'error', { error: job.error || 'Benchmark failed' });
+      return res.end();
+    }
+
+    job.subscribers.add(res);
+    req.on('close', () => {
+      job.subscribers.delete(res);
+    });
+  });
+
+  app.post('/api/runs/jobs/:jobId/cancel', (req, res) => {
+    const job = activeJobs.get(req.params.jobId);
+    if (!job) {
+      return res.status(404).json({ error: 'Benchmark job not found' });
+    }
+    job.controller.abort();
+    return res.json({ status: 'cancelling', jobId: job.jobId });
   });
 
   const isProd = process.env.NODE_ENV === 'production';

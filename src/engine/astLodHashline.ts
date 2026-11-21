@@ -1,6 +1,6 @@
 import { estimateTokens, shortLineHash } from './tokens';
 
-export type SupportedLanguage = 'typescript' | 'python' | 'go';
+export type SupportedLanguage = 'typescript' | 'python' | 'go' | 'java';
 export type LodLevel = 'LOD0' | 'LOD1' | 'LOD2';
 
 export interface HashedLine {
@@ -191,6 +191,25 @@ export function extractAstSkeleton(
         out.push(
           `L${i + 1}#${hash}: ${line.replace(/\{\s*$/, '{ ... }')}`
         );
+      }
+    }
+    return out.join('\n');
+  }
+
+  if (language === 'java') {
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const trimmed = line.trim();
+      if (
+        trimmed.startsWith('package ') ||
+        trimmed.startsWith('import ') ||
+        trimmed.startsWith('@') ||
+        /^(public|protected|private)?\s*(abstract\s+|final\s+|static\s+)*(class|interface|enum|record)\s+/.test(trimmed) ||
+        /^(public|protected|private)\s+(static\s+|synchronized\s+|final\s+)*[\w<>\[\], ?]+\s+\w+\s*\(/.test(trimmed) ||
+        trimmed.includes('@spec:')
+      ) {
+        const hash = shortLineHash(line);
+        out.push(`L${i + 1}#${hash}: ${line.replace(/\{\s*$/, '{ ... }')}`);
       }
     }
     return out.join('\n');

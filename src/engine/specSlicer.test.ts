@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseOpenSpecBundle, sliceSpecForTask } from './specSlicer';
-import { DEMO_KNOWN_CONTRACTS, DEMO_OPENSPEC_BUNDLE } from '../data/demoWorkspace';
+import { DEMO_KNOWN_CONTRACTS, DEMO_OPENSPEC_BUNDLE } from '../data/demoFixtures';
 
 test('parseOpenSpecBundle extracts all 10 REQs, 6 DES sections, and 10 tasks', () => {
   const graph = parseOpenSpecBundle(DEMO_OPENSPEC_BUNDLE);

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { runPreReviewGate } from './preReviewGate';
-import { DEMO_GATE_FILES, DEMO_OPENSPEC_BUNDLE } from '../data/demoWorkspace';
+import { DEMO_GATE_FILES, DEMO_OPENSPEC_BUNDLE } from '../data/demoFixtures';
 
 test('runPreReviewGate passes at 0 LLM tokens when all checks are green', () => {
   const res = runPreReviewGate({

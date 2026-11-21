@@ -1,156 +1,170 @@
-import { AbBenchmarkResult } from './abBenchmark';
+import { AbRunReport } from './provenance';
 
 export interface JuryDeliverablesBundle {
   reportMd: string;
+  reproducibilityMd: string;
   demoScriptMd: string;
   pitchSlidesMd: string;
   openCodePluginTs: string;
   agentsMdSnippet: string;
 }
 
-export function generateJuryDeliverables(ab: AbBenchmarkResult): JuryDeliverablesBundle {
-  const { totals, quality, stages, config } = ab;
-  const applyStage = stages.find((s) => s.stage === 'apply')!;
-  const reviewStage = stages.find((s) => s.stage === 'review')!;
+export function generateJuryDeliverables(report: AbRunReport): JuryDeliverablesBundle {
+  const { manifest, baseline, optimized, savings, provenance, limitations } = report;
+  const provBadge =
+    provenance === 'measured'
+      ? 'MEASURED (Реальные замеры API провайдера + git worktree + тесты)'
+      : provenance === 'measured_local'
+      ? 'MEASURED_LOCAL (Локальные замеры токенизации и реальные тесты без LLM API)'
+      : 'SIMULATED / DEMO FIXTURE (Локальная симуляция — НЕ является измеренным доказательством)';
 
-  const reportMd = `# SpecTrim — Аналитический отчёт для жюри хакатона СберТеха
+  const stageRows = baseline.stages
+    .map((bs, idx) => {
+      const os = optimized.stages[idx];
+      const deltaPct =
+        bs.totalTokens > 0
+          ? (((bs.totalTokens - os.totalTokens) / bs.totalTokens) * 100).toFixed(1)
+          : '0.0';
+      return `| ${bs.stageLabel} | ${bs.totalTokens.toLocaleString('ru-RU')} | ${os.totalTokens.toLocaleString('ru-RU')} | **−${deltaPct}%** | ${os.cachedInputTokens.toLocaleString('ru-RU')} | ${os.durationMs} мс | ${bs.provenance} |`;
+    })
+    .join('\n');
 
-## 1. Executive Summary
+  const reportMd = `# SpecTrim — Отчёт A/B-эксперимента SDD
 
-- **Модель и провайдер:** Строго идентичны в Baseline и SpecTrim (${ab.modelLabel}). Model Routing не используется.
-- **Общий расход токенов (Before → After):** ${totals.baselineTotal.toLocaleString('ru-RU')} → ${totals.optimizedTotal.toLocaleString('ru-RU')} токенов (**−${totals.totalSavingsPct}%**)
-- **Эффективная стоимость API (с учётом KV-cache и веса output 3x):** **−${totals.effectiveCostSavingsPct}%**
-- **Input / Output токены:** Input −${totals.inputSavingsPct}% (${totals.baselineInput.toLocaleString('ru-RU')} → ${totals.optimizedInput.toLocaleString('ru-RU')}), Output −${totals.outputSavingsPct}% (${totals.baselineOutput.toLocaleString('ru-RU')} → ${totals.optimizedOutput.toLocaleString('ru-RU')})
-- **Качество и полнота:** Покрытие требований REQ-01..REQ-${String(config.taskCount).padStart(2, '0')}: **${quality.optimizedReqCoveragePct}%** · Зелёные тесты: **${quality.optimizedTestsGreenPct}%** · Согласованность артефактов: **100%**
-- **Итерации LLM-ревью:** ${quality.baselineReviewIterations} → ${quality.optimizedReviewIterations} (после Zero-Token Pre-Review Gate)
+> **Достоверность данных (Provenance):** \`${provBadge}\`
+${limitations.length > 0 ? `\n**Ограничения замера:**\n${limitations.map((l) => `- ${l}`).join('\n')}\n` : ''}
+## 1. Идентичность условий (Run Manifest)
 
-## 2. Root Cause Analysis: почему сгорают токены в SDD
+- **Run ID:** \`${manifest.runId}\`
+- **Репозиторий / Change ID:** \`${manifest.repoName}\` / \`${manifest.changeId}\`
+- **Base Commit:** \`${manifest.baseCommit}\`
+- **Провайдер и модель (идентичны для A и B):** \`${manifest.provider}\` / \`${manifest.model}\`
+- **Язык и команды проверки:** \`${manifest.detectedLanguage}\` · \`${manifest.testCommand}\` · \`${manifest.lintCommand}\`
 
-| Стадия SDD | Baseline (ток.) | SpecTrim (ток.) | Экономия | Корневая причина перерасхода в Baseline |
+## 2. Сводка Before / After
+
+| Метрика | Baseline | SpecTrim (Optimized) | Изменение | Provenance |
 | --- | ---: | ---: | ---: | --- |
-${stages
-  .map(
-    (s) =>
-      `| ${s.stageLabel} | ${s.baselineTotal.toLocaleString('ru-RU')} | ${s.optimizedTotal.toLocaleString('ru-RU')} | **−${s.savingsPct}%** | ${s.rootCauseNote} |`
-  )
-  .join('\n')}
+| **Всего токенов** | ${baseline.totalTokens.toLocaleString('ru-RU')} | ${optimized.totalTokens.toLocaleString('ru-RU')} | **${savings.totalTokensPct !== null ? `−${savings.totalTokensPct}%` : 'n/a'}** | \`${provenance}\` |
+| **Prompt / Input токены** | ${baseline.promptTokens.toLocaleString('ru-RU')} | ${optimized.promptTokens.toLocaleString('ru-RU')} | **${savings.promptTokensPct !== null ? `−${savings.promptTokensPct}%` : 'n/a'}** | \`${provenance}\` |
+| **Cached Input токены** | ${baseline.cachedInputTokens.toLocaleString('ru-RU')} | ${optimized.cachedInputTokens.toLocaleString('ru-RU')} | cache measured: \`${optimized.cacheUsageMeasured}\` | \`${provenance}\` |
+| **Completion / Output токены** | ${baseline.completionTokens.toLocaleString('ru-RU')} | ${optimized.completionTokens.toLocaleString('ru-RU')} | **${savings.completionTokensPct !== null ? `−${savings.completionTokensPct}%` : 'n/a'}** | \`${provenance}\` |
+| **Расчётная стоимость ($)** | ${baseline.costUsd !== null ? `$${baseline.costUsd.toFixed(4)}` : 'n/a'} | ${optimized.costUsd !== null ? `$${optimized.costUsd.toFixed(4)}` : 'n/a'} | **${savings.costPct !== null ? `−${savings.costPct}%` : 'n/a'}** | \`${provenance}\` |
+| **Tool calls / Retries** | ${baseline.toolCalls} / ${baseline.retries} | ${optimized.toolCalls} / ${optimized.retries} | retries: ${savings.retriesDelta >= 0 ? `−${savings.retriesDelta}` : `+${Math.abs(savings.retriesDelta)}`} | \`${provenance}\` |
+| **Итерации LLM-ревью** | ${baseline.reviewIterations} | ${optimized.reviewIterations} | **−${savings.reviewIterationsDelta}** | \`${provenance}\` |
+| **Время выполнения** | ${(baseline.durationMs / 1000).toFixed(2)} с | ${(optimized.durationMs / 1000).toFixed(2)} с | ${savings.durationDeltaMs >= 0 ? `−${(savings.durationDeltaMs / 1000).toFixed(2)} с` : `+${(Math.abs(savings.durationDeltaMs) / 1000).toFixed(2)} с`} | \`${provenance}\` |
 
-Главные источники утечек — стадии **Apply (${applyStage.baselineTotal.toLocaleString('ru-RU')} ток.)** и **Review (${reviewStage.baselineTotal.toLocaleString('ru-RU')} ток.)**, которые в сумме формируют свыше 80% бюджета:
-1. **Квадратичный налог истории ($O(N^2)$ History Tax):** В единой сессии вывод тестов и содержимое файлов с задачи №1 переотправляются на задачах №2..№${config.taskCount}.
-2. **Монолитная спека:** На каждую задачу агент читает весь набор \`proposal/specs/design/tasks\`, хотя релевантны только 1–2 REQ и 1 секция дизайна.
-3. **Дорогой ОТК (LLM-for-Deterministic-Checks):** LLM тратит итерации на ошибки, которые проверяются локально за 0 токенов (неотмеченные задачи, забытые тесты \`@spec:REQ-XX\`, ошибки типов/линта).
+## 3. Токены по стадиям SDD
 
-## 3. Универсальность (малые vs большие LLM)
+| Стадия | Baseline (ток.) | SpecTrim (ток.) | Разница | Cached Input | Время (SpecTrim) | Provenance |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+${stageRows}
 
-На малых моделях (8B–32B) раздутый контекст вызывает **Context Rot** и промахи \`str_replace\` (${quality.baselineEditRetries} ретраев в Baseline).
-SpecTrim заменяет длинную сессию на **Fresh Micro-Session per Task + State Capsule (~210 ток.)** и **Hashline-патчи (\`L42#a9f..L48#c02\`)**, повышая процент выполнения задачи с 1-го раза с **${quality.baselineFirstPassTaskRatePct}% до ${quality.optimizedFirstPassTaskRatePct}%** и сводя ретраи правок к **${quality.optimizedEditRetries}**.
+## 4. Автоматическая проверка качества (Acceptance Criteria)
 
-## 4. Прозрачная методология A/B-замера
-
-1. Два изолированных git worktree (\`worktree-baseline\` и \`worktree-spectrim\`) на одном brownfield-репозитории (~1500 LOC) и одной фиче из ${config.taskCount} задач.
-2. Идентичная модель и провайдер в обоих прогонах; учтены все ретраи, вызовы инструментов и итерации ревью в \`metrics.jsonl\`.
-3. Жёсткий контроль паритета: прогон засчитывается только при 100% прохождении всех тестов и 100% покрытии всех требований \`REQ\`.
+- **Задачи выполнена/всего:** Baseline \`${baseline.tasksCompleted}/${baseline.tasksTotal}\` · SpecTrim \`${optimized.tasksCompleted}/${optimized.tasksTotal}\`
+- **Покрытие требований спеки (\`@spec:REQ-XX\`):** Baseline **${baseline.reqCoveragePct}%** · SpecTrim **${optimized.reqCoveragePct}%**
+- **Тесты:** Baseline \`${baseline.testsPassed ? 'PASS' : 'FAIL'}\` (${baseline.testsOutputSummary}) · SpecTrim \`${optimized.testsPassed ? 'PASS' : 'FAIL'}\` (${optimized.testsOutputSummary})
+- **Типизация и линтер:** Baseline \`${baseline.lintPassed ? 'PASS' : 'FAIL'}\` · SpecTrim \`${optimized.lintPassed ? 'PASS' : 'FAIL'}\`
+- **Согласованность \`specs ↔ design ↔ tasks\`:** Baseline \`${baseline.artifactConsistency}\` · SpecTrim \`${optimized.artifactConsistency}\`
 `;
 
-  const demoScriptMd = `# Сценарий видео-демонстрации SpecTrim (3:30)
+  const reproducibilityMd = `# Воспроизводимость и запуск SpecTrim CLI / A/B Benchmark
 
-## 0:00–0:30 · Постановка проблемы
-- **Экран:** Схема SDD-пайплайна (OpenCode + OpenSpec) и таблица расхода токенов Baseline (${totals.baselineTotal.toLocaleString('ru-RU')} токенов).
-- **Диктор:** «В Spec-Driven Development расходы растут квадратично: на ${config.taskCount}-й задаче агент тащит мусор 1-й задачи, читает всю спеку целиком и сжигает ${quality.baselineReviewIterations} круга LLM-ревью. Менять модель запрещено — значит, оптимизируем архитектуру контекста».
+## 1. Требования к окружению
+- Node.js >= 20, \`git\`, \`python3\` (для Python-полигона)
+- Ключ провайдера в переменных окружения сервера:
+  - \`GEMINI_API_KEY\` (для Google Gemini через \`@google/genai\`, по умолчанию модель \`gemini-4-hydrogen\`)
+  - или \`OPENAI_COMPAT_BASE_URL\` + \`OPENAI_COMPAT_API_KEY\` + \`OPENAI_COMPAT_MODEL\` (для OpenAI-compatible / локальных vLLM / SGLang / OpenRouter провайдеров)
 
-## 0:30–1:30 · Изоляция задач, Spec Slicer и Hashline
-- **Экран:** Вкладка «Модули SpecTrim» → выбор \`TSK-07\` в Spec Slicer, затем AST-LOD1 и Hashline patcher.
-- **Диктор:** «Вместо одной длинной сессии Spec Slicer вырезает только нужные REQ и секцию дизайна + State Capsule на ~200 токенов. AST-LOD1 отдаёт смежные файлы в виде сигнатур, а Hashline исключает ошибки str_replace у малых моделей».
+## 2. Запуск CLI поверх любого репозитория
 
-## 1:30–2:30 · Zero-Token Pre-Review Gate и A/B дашборд
-- **Экран:** Переключение дефекта (пропущенный \`@spec:REQ-07\` тест) → кнопка «Запустить Gate (0 токенов)» → переход на «Обзор A/B».
-- **Диктор:** «Pre-Review Gate за 0 токенов блокирует ревью, пока не закрыты все задачи, тесты и ссылки трассировки. В результате ревью сжимается с ${quality.baselineReviewIterations} кругов до ${quality.optimizedReviewIterations}, а общий расход падает на ${totals.totalSavingsPct}% при 100% зелёных тестах».
+\`\`\`bash
+# 1. Автоопределение стека и команд по манифесту
+npm run spectrim -- detect benchmarks/orders-ts
+npm run spectrim -- detect benchmarks/orders-py
+npm run spectrim -- detect benchmarks/edge-go
+npm run spectrim -- detect benchmarks/billing-java
 
-## 2:30–3:15 · Портативность на другом репозитории
-- **Экран:** Вкладка «Портативность» → переключение с Python/FastAPI на TypeScript/Express и Go/Gin.
-- **Диктор:** «SpecTrim без единой правки кода автоопределяет язык, тест-раннер и линтер по манифесту проекта и строит AST-скелеты».
+# 2. Инспекция графа трассировки OpenSpec change
+npm run spectrim -- inspect benchmarks/orders-ts add-rate-limit-and-audit
 
-## 3:15–3:30 · Итоги для жюри
-- **Экран:** Сводная карточка: **−${totals.totalSavingsPct}% токенов · −${totals.effectiveCostSavingsPct}% стоимости · 100% REQ · 100% тесты**.
+# 3. Извлечение task-scoped среза спеки + State Capsule
+npm run spectrim -- slice benchmarks/orders-ts add-rate-limit-and-audit --task TSK-07
+
+# 4. Запуск Zero-Token Pre-Review Gate (реальные тесты + tsc/lint + @spec:REQ-XX + консистентность)
+npm run spectrim -- gate benchmarks/orders-ts add-rate-limit-and-audit
+
+# 5. Честный A/B worktree-прогон (создаёт worktree-baseline и worktree-optimized от одного baseCommit)
+npm run spectrim -- bench benchmarks/orders-ts add-idempotency-and-webhooks --model gemini-4-hydrogen
+\`\`\`
+
+## 3. Артефакты воспроизводимого запуска
+Каждый прогон сохраняется в \`.spectrim-runs/<runId>/\`:
+- \`run_manifest.json\` — commit SHA, провайдер, модель, команды тестов/линтера, пути worktree
+- \`metrics.jsonl\` — построчная телеметрия каждого шага с \`provenance\` (\`measured\` / \`measured_local\`)
+- \`baseline.diff\` и \`optimized.diff\` — реальные \`git diff\` из изолированных worktree
+- \`summary.json\` и \`REPORT.md\` — сводные таблицы и проверка acceptance criteria
 `;
 
-  const pitchSlidesMd = `# Структура презентации (7 слайдов)
+  const demoScriptMd = `# Сценарий видео-демонстрации (3:30)
 
-## Слайд 1. SpecTrim: −${totals.totalSavingsPct}% токенов в SDD без смены модели
-- Проблема: $O(N^2)$ рост контекста + слепые циклы ревью в OpenCode + OpenSpec.
-- Решение: 5-модульная обвязка CLI + OpenCode plugin с 0 деградации качества.
-
-## Слайд 2. Где сгорают миллионы токенов (Root Cause)
-- Apply (${applyStage.baselineTotal.toLocaleString('ru-RU')} ток.) + Review (${reviewStage.baselineTotal.toLocaleString('ru-RU')} ток.) = >80% всех затрат.
-- 4 налога: History Tax, Monolithic Spec Tax, LLM-for-Deterministic-Checks, Context Rot & Cache Thrashing.
-
-## Слайд 3. Архитектура SpecTrim (5 модулей)
-- \`Spec Slicer\` → дерево \`REQ → DES → TSK\` + микро-сессии + \`State Capsule\`.
-- \`AST-LOD & Hashline\` → сигнатуры LOD1 + правки \`L42#a9f..L48#c02\`.
-- \`Output Compressor\` → вырезка шума pytest/vitest и дедупликация чтений.
-- \`Zero-Token Pre-Review Gate\` → локальный ОТК за 0 токенов.
-- \`Delta Review & KV-Cache Layout\` → инкрементальные диффы + стабильный префикс.
-
-## Слайд 4. Результаты честного A/B-бенчмарка
-- **${totals.baselineTotal.toLocaleString('ru-RU')} → ${totals.optimizedTotal.toLocaleString('ru-RU')}** токенов (−${totals.totalSavingsPct}%).
-- Итерации ревью: **${quality.baselineReviewIterations} → ${quality.optimizedReviewIterations}**.
-- Покрытие REQ: **100%** · Тесты: **100% green**.
-
-## Слайд 5. Универсальность на малых и больших LLM
-- Прогон на малой модели (8B–32B): First-pass rate вырос с **${quality.baselineFirstPassTaskRatePct}% до ${quality.optimizedFirstPassTaskRatePct}%**, ошибки правок: **${quality.baselineEditRetries} → ${quality.optimizedEditRetries}**.
-
-## Слайд 6. Портативность (Zero-Config)
-- Автодетектор \`pyproject.toml\`, \`package.json\`, \`go.mod\`, \`Cargo.toml\`.
-- Работает поверх стандартной структуры \`openspec/changes/<id>/\` без переписывания кода.
-
-## Слайд 7. Ответы на вопросы жюри (Q&A)
-- **Не теряется ли глобальный контекст при изоляции задач?** Нет — передаётся детерминированная \`State Capsule\` (экспортированные символы и контракты) + AST-LOD1 сигнатуры смежных модулей.
-- **Как это работает без смены модели?** Модель одна и та же в A и B; экономия достигается исключительно сжатием входа, устранением ретраев/лишних кругов ревью и KV-cache префиксом.
-- **Что если спека противоречива?** \`Pre-Review Gate\` проверяет связность ID \`specs ↔ design ↔ tasks\` ещё до запуска дорогого LLM-ревью.
+1. **0:00–0:35 · Реальный репозиторий и постановка**: показать \`benchmarks/orders-ts/openspec/changes/add-idempotency-and-webhooks/\` и \`run_manifest.json\` (один commit, одна модель и провайдер для A и B).
+2. **0:35–1:30 · Живой прогон A/B в двух git worktree**: запуск \`spectrim bench\` или кнопки в UI, просмотр реальных событий в \`metrics.jsonl\` с \`provenance: measured\`, сравнение \`baseline.diff\` и \`optimized.diff\`.
+3. **1:30–2:30 · Разбор 5 механизмов в действии**: Spec Slicer + State Capsule, AST-LOD1, Hashline-патч (и отказ на устаревшем хэше), сжатие TAP/pytest/git diff, Zero-Token Pre-Review Gate с реальным запуском \`tsx --test\` и \`tsc --noEmit\`.
+4. **2:30–3:10 · Портативность**: \`spectrim detect\` на TypeScript (\`package.json\`), Python (\`pyproject.toml\` + \`unittest\`), Go (\`go.mod\`) и Java (\`pom.xml\`).
+5. **3:10–3:30 · Итог**: таблица Before/After из \`REPORT.md\`, 100% покрытие REQ и 100% зелёные тесты.
 `;
 
-  const openCodePluginTs = `// .opencode/spectrim-plugin.ts — OpenCode Tool Interceptor & Lifecycle Hook
-import { sliceSpecForTask } from 'spectrim/specSlicer';
-import { formatWithHashlines, applyHashlinePatch, renderAstLodView } from 'spectrim/astLodHashline';
-import { compressTestLog, compressGitDiff } from 'spectrim/outputCompressor';
-import { runPreReviewGate } from 'spectrim/preReviewGate';
+  const pitchSlidesMd = `# Презентация SpecTrim (7 слайдов)
+
+1. **Проблема**: $O(N^2)$ рост контекста, повторное чтение спеки/кода и слепые циклы ревью в \`OpenCode + OpenSpec\`.
+2. **Ограничения**: без model routing, без урезания требований, 100% REQ и зелёные тесты.
+3. **Архитектура**: Spec Slicer + State Capsule, AST-LOD + Hashline, Diff/Log Compressor, Zero-Token Pre-Review Gate, Delta Review + KV-Cache порядок.
+4. **Доказательная база A/B**: два изолированных \`git worktree\` от одного \`baseCommit\`, реальный \`usageMetadata\` провайдера в \`metrics.jsonl\`, строгая маркировка \`measured\` vs \`simulated\`.
+5. **Универсальность**: микро-сессии и Hashline убирают Context Rot и ошибки патчей на малых и больших LLM.
+6. **Портативность**: автодетект TS/JS, Python, Go, Java по манифестам без правки ядра.
+7. **Артефакты**: \`REPORT.md\`, \`run_manifest.json\`, \`.opencode/plugins/spectrim.ts\`.
+`;
+
+  const openCodePluginTs = `// .opencode/plugins/spectrim.ts — OpenCode Plugin Hook
+import { sliceSpecForTask } from '../../src/engine/specSlicer';
+import { renderAstLodView, applyHashlinePatch } from '../../src/engine/astLodHashline';
+import { compressTestLog, compressGitDiff } from '../../src/engine/outputCompressor';
+import { runLocalPreReviewGate } from '../../src/runtime/localGateRunner';
 
 export const specTrimPlugin = {
-  name: 'spectrim-sdd-optimizer',
-  onTaskStart: async ({ changeId, taskId, completedTasks }) => {
-    // 1. Fresh micro-session with sliced spec + State Capsule
-    return sliceSpecForTask(changeId, taskId, completedTasks);
+  name: 'spectrim-sdd',
+  async beforeTask(ctx: { bundle: any; taskId: string; completedTaskIds: string[] }) {
+    return sliceSpecForTask(ctx.bundle, ctx.taskId, ctx.completedTaskIds);
   },
-  onBeforeToolRead: async ({ filePath, isTargetFile, content, language }) => {
-    // 2. LOD0 Hashlines for target file; LOD1 AST skeleton for dependencies
-    return renderAstLodView(filePath, content, language, isTargetFile ? 'LOD0' : 'LOD1');
+  async readContext(ctx: { filePath: string; content: string; language: any; isTarget: boolean }) {
+    return renderAstLodView(ctx.filePath, ctx.content, ctx.language, ctx.isTarget ? 'LOD0' : 'LOD1');
   },
-  onAfterBashOutput: async ({ command, stdout }) => {
-    // 3. Compress verbose test logs & git diffs before feeding back to LLM
-    if (/pytest|vitest|jest|go test/.test(command)) return compressTestLog(stdout);
-    if (command.startsWith('git diff')) return compressGitDiff(stdout);
-    return stdout;
+  async compressToolOutput(ctx: { command: string; stdout: string }) {
+    if (/test|pytest|vitest|jest|unittest/.test(ctx.command)) return compressTestLog(ctx.stdout).compressed;
+    if (ctx.command.startsWith('git diff')) return compressGitDiff(ctx.stdout).compressed;
+    return ctx.stdout;
   },
-  onBeforeReview: async (gateInput) => {
-    // 4. Zero-Token Pre-Review Gate blocks LLM review until deterministic checks pass
-    const gate = runPreReviewGate(gateInput);
-    if (!gate.passed) throw new Error(gate.conciseReport);
-    return gate;
+  async beforeReview(ctx: { repoPath: string; changeId: string }) {
+    return runLocalPreReviewGate(ctx.repoPath, ctx.changeId);
   },
+  applyHashlinePatch,
 };
 `;
 
-  const agentsMdSnippet = `# AGENTS.md (SpecTrim SDD Policy)
+  const agentsMdSnippet = `# AGENTS.md — SpecTrim SDD Workflow Policy
 
-1. Никогда не читай все файлы \`openspec/changes/<id>/\` целиком: используй \`spectrim slice <id> --task TSK-XX\`.
-2. Для смежных файлов используй AST-скелеты (LOD1), для целевого файла — Hashline (\`L42#a9f\`).
-3. Правки вноси только диапазонами хэшей \`applyHashlinePatch(start#hash..end#hash)\` — не цитируй старый код в ответе.
-4. Каждую функцию и тест маркируй комментарием \`@spec:REQ-XX\`.
-5. Перед вызовом LLM-ревьюера обязательно запусти \`spectrim gate <change-id>\` (0 токенов).
+1. Для каждой задачи \`TSK-XX\` работай в изолированной сессии и запрашивай срез спеки через \`spectrim slice <repo> <changeId> --task TSK-XX\`.
+2. Читай целевые файлы в формате Hashline (\`LOD0\`), а смежные зависимости — в формате AST-скелета (\`LOD1\`).
+3. Используй Hashline range-патчи (\`L{start}#{hash}..L{end}#{hash}\`) вместо переписывания файлов целиком.
+4. Маркируй реализацию и тесты комментариями \`@spec:REQ-XX\`.
+5. Перед вызовом LLM-ревьюера запускай \`spectrim gate <repo> <changeId>\` (0 токенов).
 `;
 
   return {
     reportMd,
+    reproducibilityMd,
     demoScriptMd,
     pitchSlidesMd,
     openCodePluginTs,

@@ -1,0 +1,128 @@
+export type DataProvenance =
+  | 'measured'
+  | 'measured_local'
+  | 'estimated'
+  | 'simulated'
+  | 'demo_fixture';
+
+export type SddStage = 'spec_prep' | 'apply' | 'review' | 'verify';
+
+export interface RunManifest {
+  runId: string;
+  createdAt: string;
+  repoPath: string;
+  repoName: string;
+  changeId: string;
+  baseCommit: string;
+  provider: string;
+  model: string;
+  sameModelEnforced: true;
+  detectedLanguage: string;
+  testCommand: string;
+  lintCommand: string;
+  baselineWorktree: string;
+  optimizedWorktree: string;
+  status: 'running' | 'completed' | 'cancelled' | 'failed';
+  error?: string;
+}
+
+export interface TelemetryEventRecord {
+  ts: string;
+  run: 'baseline' | 'spectrim';
+  provider: string;
+  model: string;
+  stage: SddStage;
+  task_id: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_input_tokens: number;
+  uncached_input_tokens: number;
+  thoughts_tokens: number;
+  total_tokens: number;
+  tool_calls: number;
+  retries: number;
+  review_iteration: number;
+  duration_ms: number;
+  cost_usd: number | null;
+  cache_usage_measured: boolean;
+  provenance: DataProvenance;
+}
+
+export interface StageSideBreakdown {
+  stage: SddStage;
+  stageLabel: string;
+  promptTokens: number;
+  completionTokens: number;
+  cachedInputTokens: number;
+  uncachedInputTokens: number;
+  thoughtsTokens: number;
+  totalTokens: number;
+  durationMs: number;
+  toolCalls: number;
+  retries: number;
+  provenance: DataProvenance;
+}
+
+export interface PipelineSideSummary {
+  side: 'baseline' | 'spectrim';
+  provenance: DataProvenance;
+  promptTokens: number;
+  completionTokens: number;
+  cachedInputTokens: number;
+  uncachedInputTokens: number;
+  thoughtsTokens: number;
+  totalTokens: number;
+  costUsd: number | null;
+  cacheUsageMeasured: boolean;
+  durationMs: number;
+  toolCalls: number;
+  retries: number;
+  reviewIterations: number;
+  testsPassed: boolean;
+  testsOutputSummary: string;
+  lintPassed: boolean;
+  lintOutputSummary: string;
+  reqCoveragePct: number;
+  coveredReqs: string[];
+  uncoveredReqs: string[];
+  artifactConsistency: boolean;
+  tasksCompleted: number;
+  tasksTotal: number;
+  changedFiles: string[];
+  diffLineCount: number;
+  stages: StageSideBreakdown[];
+}
+
+export interface AbRunReport {
+  manifest: RunManifest;
+  provenance: DataProvenance;
+  limitations: string[];
+  baseline: PipelineSideSummary;
+  optimized: PipelineSideSummary;
+  savings: {
+    totalTokensPct: number | null;
+    promptTokensPct: number | null;
+    completionTokensPct: number | null;
+    costPct: number | null;
+    reviewIterationsDelta: number;
+    retriesDelta: number;
+    durationDeltaMs: number;
+  };
+  qualityParityPassed: boolean;
+  baselineDiff: string;
+  optimizedDiff: string;
+  metricsJsonl: string;
+}
+
+export interface ProviderStatus {
+  geminiConfigured: boolean;
+  openAiCompatConfigured: boolean;
+  defaultProvider: 'gemini' | 'openai_compat' | 'none';
+  availableModels: Array<{
+    id: string;
+    label: string;
+    provider: 'gemini' | 'openai_compat';
+    tier: 'small' | 'large';
+  }>;
+  limitationNote: string;
+}

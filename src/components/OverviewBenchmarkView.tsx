@@ -1,31 +1,85 @@
 import React from 'react';
-import { AbBenchmarkResult, BenchmarkConfig } from '../engine/abBenchmark';
-import { Check, Layers, ShieldCheck } from 'lucide-react';
+import {
+  ActiveBenchmarkState,
+  LiveRunProgressEvent,
+  PROVENANCE_LABEL,
+  SimulationConfig,
+  WorkbenchStatusResponse,
+} from '../types/workbench';
+import { AlertTriangle, Check, GitBranch, Layers, ShieldCheck, Square } from 'lucide-react';
 
 interface OverviewBenchmarkViewProps {
-  benchmark: AbBenchmarkResult;
-  config: BenchmarkConfig;
-  onUpdateConfig: (patch: Partial<BenchmarkConfig>) => void;
-  onRunBenchmark: () => void;
-  isRunning: boolean;
+  activeData: ActiveBenchmarkState;
+  viewMode: 'measured' | 'simulated';
+  onChangeViewMode: (mode: 'measured' | 'simulated') => void;
+  hasMeasuredRun: boolean;
+  simConfig: SimulationConfig;
+  onUpdateSimConfig: (patch: Partial<SimulationConfig>) => void;
+  onRunServerSimulation: () => void;
+  status: WorkbenchStatusResponse | null;
+  statusLoading: boolean;
+  selectedRepoPath: string;
+  onChangeRepoPath: (repo: string) => void;
+  selectedChangeId: string;
+  onChangeChangeId: (changeId: string) => void;
+  selectedModel: string;
+  onChangeModel: (model: string) => void;
+  maxReviewIters: number;
+  onChangeMaxReviewIters: (iters: number) => void;
+  isRunningReal: boolean;
+  onStartRealRun: () => void;
+  onCancelRealRun: () => void;
+  liveEvents: LiveRunProgressEvent[];
+  runError: string | null;
+  onLoadSavedRun: (runId: string) => void;
 }
 
 export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
-  benchmark,
-  config,
-  onUpdateConfig,
-  onRunBenchmark,
-  isRunning,
+  activeData,
+  viewMode,
+  onChangeViewMode,
+  hasMeasuredRun,
+  simConfig,
+  onUpdateSimConfig,
+  onRunServerSimulation,
+  status,
+  statusLoading,
+  selectedRepoPath,
+  onChangeRepoPath,
+  selectedChangeId,
+  onChangeChangeId,
+  selectedModel,
+  onChangeModel,
+  maxReviewIters,
+  onChangeMaxReviewIters,
+  isRunningReal,
+  onStartRealRun,
+  onCancelRealRun,
+  liveEvents,
+  runError,
+  onLoadSavedRun,
 }) => {
-  const { totals, stages, quality, kvCacheLayout } = benchmark;
+  const { report, kvCacheLayout } = activeData;
+  const { manifest, baseline, optimized, savings, provenance, limitations } = report;
+
   const maxStageTokens = Math.max(
-    ...stages.map((s) => Math.max(s.baselineTotal, s.optimizedTotal)),
+    ...baseline.stages.map((bs, idx) =>
+      Math.max(bs.totalTokens, optimized.stages[idx]?.totalTokens ?? 0)
+    ),
     1
+  );
+
+  const gitRepos = (status?.repos ?? []).filter((r) => r.isGitRepo && r.changes.length > 0);
+  const currentRepo =
+    gitRepos.find((r) => r.repoPath === selectedRepoPath) ?? gitRepos[0] ?? null;
+  const availableModels = status?.provider.availableModels ?? [];
+  const providerReady = Boolean(
+    status && status.provider.defaultProvider !== 'none' && availableModels.length > 0
   );
 
   const moduleToggles: Array<{
     key: keyof Pick<
-      BenchmarkConfig,
+      SimulationConfig,
       | 'enableSpecSlicer'
       | 'enableAstLodHashline'
       | 'enableOutputCompressor'
@@ -35,22 +89,45 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
     label: string;
     effect: string;
   }> = [
-    { key: 'enableSpecSlicer', label: 'Spec Slicer + микро-сессии', effect: 'Убирает O(N²) историю и монолитную спеку' },
-    { key: 'enableAstLodHashline', label: 'AST-LOD1 + Hashline', effect: 'Скелеты смежных файлов и правки без ретраев' },
-    { key: 'enableOutputCompressor', label: 'Output & Diff Compressor', effect: 'Вырезка шума тестов и дедупликация чтений' },
-    { key: 'enablePreReviewGate', label: 'Zero-Token Pre-Review Gate', effect: 'Отсекает дефекты до дорогого LLM-ревью' },
-    { key: 'enableDeltaReviewAndCache', label: 'Delta Review + KV-Cache', effect: 'Стабильный префикс и дифф только дельты' },
+    {
+      key: 'enableSpecSlicer',
+      label: 'Spec Slicer + микро-сессии',
+      effect: 'Убирает O(N²) историю и монолитную спеку',
+    },
+    {
+      key: 'enableAstLodHashline',
+      label: 'AST-LOD1 + Hashline',
+      effect: 'Скелеты смежных файлов и правки без ретраев',
+    },
+    {
+      key: 'enableOutputCompressor',
+      label: 'Output & Diff Compressor',
+      effect: 'Вырезка шума тестов и дедупликация чтений',
+    },
+    {
+      key: 'enablePreReviewGate',
+      label: 'Zero-Token Pre-Review Gate',
+      effect: 'Отсекает дефекты до дорогого LLM-ревью',
+    },
+    {
+      key: 'enableDeltaReviewAndCache',
+      label: 'Delta Review + KV-Cache',
+      effect: 'Стабильный префикс и дифф только дельты',
+    },
   ];
+
+  const pct = (b: number, o: number) =>
+    b > 0 ? Number((((b - o) / b) * 100).toFixed(1)) : 0;
 
   return (
     <div className="space-y-8">
-      {/* Intro & Simulation Control Strip */}
+      {/* Intro & Mode Selector */}
       <section className="flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between border-b border-slate-200 pb-6">
         <div className="max-w-2xl space-y-2">
           <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
             <span>OpenCode + OpenSpec</span>
             <span aria-hidden="true">·</span>
-            <span>Одинаковая модель для A и B</span>
+            <span>Идентичный commit, модель и провайдер для A и B</span>
             <span aria-hidden="true">·</span>
             <span>Без model routing</span>
           </div>
@@ -58,41 +135,245 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
             A/B-стенд экономии токенов в Spec-Driven Development
           </h1>
           <p className="text-sm sm:text-base text-slate-600 leading-relaxed">
-            Сравнение стандартного монолитного пайплайна (Baseline) и 5-модульной архитектуры SpecTrim
-            на brownfield-фиче ({config.taskCount} задач, требования REQ-01..REQ-{String(config.taskCount).padStart(2, '0')}).
+            Изолированный A/B-прогон в двух <code className="font-mono text-xs bg-slate-100 px-1.5 py-0.5 rounded">git worktree</code> поверх реальных репозиториев и OpenSpec-артефактов с фиксацией <code className="font-mono text-xs bg-slate-100 px-1.5 py-0.5 rounded">usageMetadata</code>.
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-3 shrink-0">
+        <div className="flex flex-wrap items-center gap-3 w-full lg:w-auto">
           <div
             role="group"
-            aria-label="Выбор класса модели"
-            className="inline-flex rounded-lg bg-slate-100 p-1 border border-slate-200"
+            aria-label="Режим источника данных A/B"
+            className="inline-flex w-full sm:w-auto rounded-lg bg-slate-100 p-1 border border-slate-200"
           >
             <button
               type="button"
-              onClick={() => onUpdateConfig({ modelTier: 'small' })}
-              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                config.modelTier === 'small'
+              onClick={() => onChangeViewMode('measured')}
+              disabled={!hasMeasuredRun}
+              className={`flex-1 sm:flex-none px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap disabled:opacity-50 ${
+                viewMode === 'measured'
                   ? 'bg-white text-slate-900 shadow-xs'
                   : 'text-slate-600 hover:text-slate-900'
               }`}
             >
-              Малая LLM (8B–32B)
+              Реальный A/B
             </button>
             <button
               type="button"
-              onClick={() => onUpdateConfig({ modelTier: 'large' })}
-              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                config.modelTier === 'large'
+              onClick={() => onChangeViewMode('simulated')}
+              className={`flex-1 sm:flex-none px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+                viewMode === 'simulated'
                   ? 'bg-white text-slate-900 shadow-xs'
                   : 'text-slate-600 hover:text-slate-900'
               }`}
             >
-              Большая LLM (Frontier)
+              Симуляция
             </button>
           </div>
         </div>
+      </section>
+
+      {/* Honest Data Provenance Notice */}
+      <section
+        aria-label="Статус достоверности данных"
+        className={`rounded-xl border p-4 text-xs space-y-1.5 ${
+          provenance === 'measured'
+            ? 'bg-emerald-50/70 border-emerald-200 text-emerald-950'
+            : 'bg-amber-50/70 border-amber-200 text-amber-950'
+        }`}
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2 font-semibold">
+          <span>Достоверность активного отчёта: {PROVENANCE_LABEL[provenance]}</span>
+          <span className="font-mono text-slate-700">
+            runId: {manifest.runId} · commit:{' '}
+            {manifest.baseCommit.length > 12
+              ? manifest.baseCommit.slice(0, 10)
+              : manifest.baseCommit}
+          </span>
+        </div>
+        {limitations.length > 0 && (
+          <ul className="list-disc pl-4 space-y-0.5 text-slate-700">
+            {limitations.map((item, idx) => (
+              <li key={idx}>{item}</li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      {/* Real Isolated Worktree A/B Execution Panel */}
+      <section
+        aria-label="Запуск реального git worktree A/B-эксперимента"
+        className="bg-white border border-slate-200 rounded-xl p-6 space-y-5"
+      >
+        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <GitBranch className="w-4 h-4 text-blue-600 shrink-0" aria-hidden="true" />
+              <h2 className="text-base font-semibold text-slate-900">
+                Реальный A/B-прогон в изолированных git worktree
+              </h2>
+            </div>
+            <p className="text-xs text-slate-600">
+              Создаёт два отдельных worktree от одного commit SHA, прогоняет Baseline и SpecTrim на одной модели, запускает реальные тесты и сохраняет <code className="font-mono">metrics.jsonl</code> + diff в <code className="font-mono">.spectrim-runs/</code>.
+            </p>
+          </div>
+
+          {status && status.savedRuns.length > 0 && (
+            <div className="flex items-center gap-2 shrink-0">
+              <label htmlFor="saved-run-select" className="text-xs font-medium text-slate-600">
+                Сохранённые прогоны:
+              </label>
+              <select
+                id="saved-run-select"
+                value={viewMode === 'measured' ? manifest.runId : ''}
+                onChange={(e) => {
+                  if (e.target.value) void onLoadSavedRun(e.target.value);
+                }}
+                className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-mono text-slate-900"
+              >
+                <option value="">Выберите прогон...</option>
+                {status.savedRuns.map((r) => (
+                  <option key={r.runId} value={r.runId}>
+                    {r.runId} ({r.repoName} / {r.totalSavingsPct ?? 0}%)
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div>
+            <label htmlFor="ab-repo" className="block text-xs font-medium text-slate-700 mb-1">
+              Git-репозиторий
+            </label>
+            <select
+              id="ab-repo"
+              value={selectedRepoPath}
+              onChange={(e) => onChangeRepoPath(e.target.value)}
+              disabled={statusLoading || isRunningReal}
+              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-mono text-slate-900"
+            >
+              {gitRepos.length === 0 ? (
+                <option value="benchmarks/orders-ts">benchmarks/orders-ts</option>
+              ) : (
+                gitRepos.map((r) => (
+                  <option key={r.repoPath} value={r.repoPath}>
+                    {r.repoPath} ({r.language})
+                  </option>
+                ))
+              )}
+            </select>
+          </div>
+
+          <div>
+            <label htmlFor="ab-change" className="block text-xs font-medium text-slate-700 mb-1">
+              OpenSpec Change
+            </label>
+            <select
+              id="ab-change"
+              value={selectedChangeId}
+              onChange={(e) => onChangeChangeId(e.target.value)}
+              disabled={statusLoading || isRunningReal}
+              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-mono text-slate-900"
+            >
+              {(currentRepo?.changes ?? ['add-idempotency-and-webhooks', 'add-rate-limit-and-audit']).map(
+                (ch) => (
+                  <option key={ch} value={ch}>
+                    {ch}
+                  </option>
+                )
+              )}
+            </select>
+          </div>
+
+          <div>
+            <label htmlFor="ab-model" className="block text-xs font-medium text-slate-700 mb-1">
+              Единая модель (A и B)
+            </label>
+            <select
+              id="ab-model"
+              value={selectedModel}
+              onChange={(e) => onChangeModel(e.target.value)}
+              disabled={!providerReady || isRunningReal}
+              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-mono text-slate-900 disabled:bg-slate-100 disabled:text-slate-500"
+            >
+              {providerReady ? (
+                availableModels.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                  </option>
+                ))
+              ) : (
+                <option value="">Ключ провайдера не задан на сервере</option>
+              )}
+            </select>
+          </div>
+
+          <div>
+            <label htmlFor="ab-reviews" className="block text-xs font-medium text-slate-700 mb-1">
+              Макс. итераций ревью в Baseline
+            </label>
+            <select
+              id="ab-reviews"
+              value={maxReviewIters}
+              onChange={(e) => onChangeMaxReviewIters(Number(e.target.value))}
+              disabled={isRunningReal}
+              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-mono text-slate-900"
+            >
+              {[1, 2, 3, 4, 5].map((n) => (
+                <option key={n} value={n}>
+                  {n} {n === 1 ? 'итерация' : n < 5 ? 'итерации' : 'итераций'}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+          <div className="text-xs text-slate-600">
+            {status?.provider.limitationNote ?? 'Проверка окружения сервера...'}
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            {isRunningReal && (
+              <button
+                type="button"
+                onClick={onCancelRealRun}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-red-300 bg-red-50 hover:bg-red-100 text-red-800 text-xs font-medium transition-colors whitespace-nowrap"
+              >
+                <Square className="w-3.5 h-3.5" aria-hidden="true" />
+                Отменить прогон
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onStartRealRun}
+              disabled={isRunningReal}
+              className="px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white text-xs font-medium transition-colors whitespace-nowrap"
+            >
+              {isRunningReal ? 'Идёт worktree A/B прогон...' : 'Запустить реальный worktree A/B'}
+            </button>
+          </div>
+        </div>
+
+        {runError && (
+          <div
+            role="alert"
+            className="rounded-lg border border-red-200 bg-red-50 p-3.5 text-xs text-red-900 flex items-start gap-2"
+          >
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-red-700" aria-hidden="true" />
+            <span>{runError}</span>
+          </div>
+        )}
+
+        {liveEvents.length > 0 && (
+          <div className="bg-slate-900 text-slate-100 rounded-lg p-3.5 text-xs font-mono space-y-1 max-h-44 overflow-y-auto">
+            {liveEvents.map((ev, idx) => (
+              <div key={idx}>
+                <span className="text-slate-400">[{ev.phase}]</span> {ev.message}
+              </div>
+            ))}
+          </div>
+        )}
       </section>
 
       {/* 4-Column KPI Summary Strip */}
@@ -104,44 +385,46 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
           <div className="text-xs font-medium text-slate-500">Общий расход токенов</div>
           <div className="flex items-baseline justify-between gap-2">
             <span className="text-2xl font-bold text-slate-900 tabular-nums">
-              −{totals.totalSavingsPct}%
+              {savings.totalTokensPct !== null ? `−${savings.totalTokensPct}%` : 'n/a'}
             </span>
             <span className="text-xs font-semibold text-emerald-700 tabular-nums">
-              {totals.optimizedTotal.toLocaleString('ru-RU')} ток.
+              {optimized.totalTokens.toLocaleString('ru-RU')} ток.
             </span>
           </div>
           <div className="text-xs text-slate-500 tabular-nums">
-            Baseline: {totals.baselineTotal.toLocaleString('ru-RU')} токенов
+            Baseline: {baseline.totalTokens.toLocaleString('ru-RU')} токенов
           </div>
         </div>
 
         <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-2">
-          <div className="text-xs font-medium text-slate-500">Эффективная стоимость API</div>
+          <div className="text-xs font-medium text-slate-500">Стоимость и Cached Input</div>
           <div className="flex items-baseline justify-between gap-2">
             <span className="text-2xl font-bold text-slate-900 tabular-nums">
-              −{totals.effectiveCostSavingsPct}%
+              {savings.costPct !== null ? `−${savings.costPct}%` : 'n/a'}
             </span>
             <span className="text-xs font-medium text-slate-600 tabular-nums">
-              Out: −{totals.outputSavingsPct}%
+              Out: {savings.completionTokensPct !== null ? `−${savings.completionTokensPct}%` : 'n/a'}
             </span>
           </div>
           <div className="text-xs text-slate-500 tabular-nums">
-            С учётом KV-cache ({config.kvCacheHitRatePct}%) и веса output 3x
+            Cached: {optimized.cachedInputTokens.toLocaleString('ru-RU')} ·{' '}
+            {optimized.costUsd !== null ? `$${optimized.costUsd.toFixed(4)}` : 'тариф n/a'}
           </div>
         </div>
 
         <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-2">
-          <div className="text-xs font-medium text-slate-500">Итерации LLM-ревью</div>
+          <div className="text-xs font-medium text-slate-500">Итерации ревью и tool calls</div>
           <div className="flex items-baseline justify-between gap-2">
             <span className="text-2xl font-bold text-slate-900 tabular-nums">
-              {quality.baselineReviewIterations} → {quality.optimizedReviewIterations}
+              {baseline.reviewIterations} → {optimized.reviewIterations}
             </span>
             <span className="text-xs font-medium text-blue-700 tabular-nums">
               Gate: 0 ток.
             </span>
           </div>
           <div className="text-xs text-slate-500 tabular-nums">
-            Ретраи правок: {quality.baselineEditRetries} → {quality.optimizedEditRetries}
+            Tools: {baseline.toolCalls} → {optimized.toolCalls} · Retries: {baseline.retries} →{' '}
+            {optimized.retries}
           </div>
         </div>
 
@@ -149,30 +432,30 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
           <div className="text-xs font-medium text-slate-500">Контроль качества (Parity)</div>
           <div className="flex items-baseline justify-between gap-2">
             <span className="text-2xl font-bold text-emerald-700 tabular-nums">
-              {quality.optimizedReqCoveragePct}% REQ
+              {optimized.reqCoveragePct}% REQ
             </span>
             <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700">
               <ShieldCheck className="w-3.5 h-3.5" aria-hidden="true" />
-              {quality.optimizedTestsGreenPct}% тесты
+              {optimized.testsPassed ? 'Тесты PASS' : 'Тесты FAIL'}
             </span>
           </div>
           <div className="text-xs text-slate-500 tabular-nums">
-            First-pass: {quality.baselineFirstPassTaskRatePct}% → {quality.optimizedFirstPassTaskRatePct}%
+            Задачи: {optimized.tasksCompleted}/{optimized.tasksTotal} · Lint:{' '}
+            {optimized.lintPassed ? 'PASS' : 'FAIL'}
           </div>
         </div>
       </section>
 
-      {/* Main Split: Stage Chart & Interactive Parameters */}
+      {/* Main Split: Stage Chart & Simulation / Run Controls */}
       <section className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
-        {/* Left 8 cols: Stage-by-stage SVG Visualization */}
         <div className="lg:col-span-8 bg-white border border-slate-200 rounded-xl p-6 flex flex-col space-y-6">
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
             <div>
               <h2 className="text-lg font-semibold text-slate-900">
                 Расход токенов по стадиям SDD (Baseline vs SpecTrim)
               </h2>
-              <p className="text-xs text-slate-500 mt-0.5">
-                {benchmark.modelLabel}
+              <p className="text-xs text-slate-500 mt-0.5 font-mono">
+                {manifest.provider} · {manifest.model} · {manifest.repoName} / {manifest.changeId}
               </p>
             </div>
             <div className="flex items-center gap-4 text-xs text-slate-600 shrink-0">
@@ -187,24 +470,26 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
             </div>
           </div>
 
-          {/* Crisp Horizontal Grouped Bar Chart */}
           <div className="space-y-5" data-testid="stage-chart">
-            {stages.map((s) => {
-              const basePct = Math.max(4, (s.baselineTotal / maxStageTokens) * 100);
-              const optPct = Math.max(2, (s.optimizedTotal / maxStageTokens) * 100);
+            {baseline.stages.map((bs, idx) => {
+              const os = optimized.stages[idx];
+              if (!os) return null;
+              const basePct = Math.max(4, (bs.totalTokens / maxStageTokens) * 100);
+              const optPct = Math.max(2, (os.totalTokens / maxStageTokens) * 100);
+              const stageSaving = pct(bs.totalTokens, os.totalTokens);
               return (
-                <div key={s.stage} className="space-y-2">
+                <div key={bs.stage} className="space-y-2">
                   <div className="flex items-center justify-between gap-4 text-sm">
-                    <span className="font-medium text-slate-800">{s.stageLabel}</span>
+                    <span className="font-medium text-slate-800">{bs.stageLabel}</span>
                     <div className="flex items-center gap-3 text-xs tabular-nums">
                       <span className="text-slate-500">
-                        {s.baselineTotal.toLocaleString('ru-RU')} →{' '}
+                        {bs.totalTokens.toLocaleString('ru-RU')} →{' '}
                         <strong className="text-slate-900">
-                          {s.optimizedTotal.toLocaleString('ru-RU')}
+                          {os.totalTokens.toLocaleString('ru-RU')}
                         </strong>
                       </span>
                       <span className="font-semibold text-emerald-700 min-w-[3.5rem] text-right">
-                        −{s.savingsPct}%
+                        −{stageSaving}%
                       </span>
                     </div>
                   </div>
@@ -222,131 +507,216 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
                       />
                     </div>
                   </div>
-                  <p className="text-xs text-slate-500">{s.rootCauseNote}</p>
                 </div>
               );
             })}
           </div>
 
-          {/* Mathematical Model & Root-Cause Summary */}
           <div className="mt-auto border-t border-slate-100 pt-4 grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
             <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-1">
-              <div className="font-semibold text-slate-800">Формула утечек в Baseline (O(N²))</div>
+              <div className="font-semibold text-slate-800">Проверка качества на worktree</div>
               <div className="font-mono text-slate-600 leading-relaxed">
-                T_total = Σ(T_sys + T_spec + T_history(t) + T_tool(t)) + ΣT_out
+                Test: {manifest.testCommand}
+                <br />
+                Lint: {manifest.lintCommand}
               </div>
             </div>
             <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-1">
               <div className="font-semibold text-slate-800">Почему SpecTrim побеждает без смены LLM</div>
               <div className="text-slate-600 leading-relaxed">
-                Apply + Review сжигают &gt;85% бюджета Baseline. Изоляция сессий и Pre-Review Gate (0 ток.) переводят рост из O(N²) в O(N).
+                Изоляция микро-сессий, Hashline range-патчи, AST-LOD1 и Pre-Review Gate переводят рост контекста из O(N²) в O(N).
               </div>
             </div>
           </div>
         </div>
 
-        {/* Right 4 cols: Interactive Benchmark Controls & Ablation Toggles */}
-        <div className="lg:col-span-4 bg-white border border-slate-200 rounded-xl p-6 space-y-6">
-          <div>
-            <h2 className="text-lg font-semibold text-slate-900">Параметры эксперимента</h2>
-            <p className="text-xs text-slate-500 mt-0.5">
-              Проверка вклада каждого модуля (Ablation Study)
-            </p>
-          </div>
-
-          <div className="space-y-4">
-            <div>
-              <div className="flex justify-between text-xs font-medium text-slate-700 mb-1.5">
-                <label htmlFor="slider-tasks">Количество задач в фиче (K)</label>
-                <span className="font-mono tabular-nums text-slate-900">{config.taskCount}</span>
+        {/* Right 4 cols: Simulation Ablation Controls OR Real Run Parity Details */}
+        <div className="lg:col-span-4 bg-white border border-slate-200 rounded-xl p-6 space-y-5">
+          {viewMode === 'simulated' ? (
+            <>
+              <div>
+                <h2 className="text-lg font-semibold text-slate-900">
+                  Параметры мат. симуляции
+                </h2>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Ablation Study (provenance: simulated)
+                </p>
               </div>
-              <input
-                id="slider-tasks"
-                type="range"
-                min={6}
-                max={16}
-                value={config.taskCount}
-                onChange={(e) => onUpdateConfig({ taskCount: Number(e.target.value) })}
-                className="w-full accent-blue-600 cursor-pointer"
-              />
-            </div>
 
-            <div>
-              <div className="flex justify-between text-xs font-medium text-slate-700 mb-1.5">
-                <label htmlFor="slider-reviews">Итерации ревью в Baseline (R)</label>
-                <span className="font-mono tabular-nums text-slate-900">{config.baselineReviewIters}</span>
-              </div>
-              <input
-                id="slider-reviews"
-                type="range"
-                min={2}
-                max={6}
-                value={config.baselineReviewIters}
-                onChange={(e) => onUpdateConfig({ baselineReviewIters: Number(e.target.value) })}
-                className="w-full accent-blue-600 cursor-pointer"
-              />
-            </div>
+              <div className="space-y-4">
+                <div className="inline-flex w-full rounded-lg bg-slate-100 p-1 border border-slate-200">
+                  <button
+                    type="button"
+                    onClick={() => onUpdateSimConfig({ modelTier: 'small' })}
+                    className={`flex-1 px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+                      simConfig.modelTier === 'small'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Малая LLM
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onUpdateSimConfig({ modelTier: 'large' })}
+                    className={`flex-1 px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+                      simConfig.modelTier === 'large'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Большая LLM
+                  </button>
+                </div>
 
-            <div>
-              <div className="flex justify-between text-xs font-medium text-slate-700 mb-1.5">
-                <label htmlFor="slider-cache">Prefix KV-Cache Hit Rate</label>
-                <span className="font-mono tabular-nums text-slate-900">{config.kvCacheHitRatePct}%</span>
-              </div>
-              <input
-                id="slider-cache"
-                type="range"
-                min={30}
-                max={92}
-                value={config.kvCacheHitRatePct}
-                onChange={(e) => onUpdateConfig({ kvCacheHitRatePct: Number(e.target.value) })}
-                className="w-full accent-blue-600 cursor-pointer"
-              />
-            </div>
-          </div>
-
-          <div className="border-t border-slate-200 pt-4 space-y-2.5">
-            <div className="text-xs font-semibold text-slate-700">Активные модули SpecTrim</div>
-            {moduleToggles.map((mod) => {
-              const checked = config[mod.key];
-              return (
-                <label
-                  key={mod.key}
-                  className="flex items-start gap-2.5 cursor-pointer py-1 rounded-md hover:bg-slate-50 px-1.5 -mx-1.5"
-                >
+                <div>
+                  <div className="flex justify-between text-xs font-medium text-slate-700 mb-1.5">
+                    <label htmlFor="slider-tasks">Задач в фиче (K)</label>
+                    <span className="font-mono tabular-nums text-slate-900">
+                      {simConfig.taskCount}
+                    </span>
+                  </div>
                   <input
-                    type="checkbox"
-                    checked={checked}
-                    onChange={(e) => onUpdateConfig({ [mod.key]: e.target.checked })}
-                    className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                    id="slider-tasks"
+                    type="range"
+                    min={6}
+                    max={16}
+                    value={simConfig.taskCount}
+                    onChange={(e) => onUpdateSimConfig({ taskCount: Number(e.target.value) })}
+                    className="w-full accent-blue-600 cursor-pointer"
                   />
-                  <span className="text-xs leading-snug">
-                    <span className="font-medium text-slate-800 block">{mod.label}</span>
-                    <span className="text-slate-500">{mod.effect}</span>
-                  </span>
-                </label>
-              );
-            })}
-          </div>
+                </div>
 
-          <button
-            type="button"
-            onClick={onRunBenchmark}
-            disabled={isRunning}
-            className="w-full py-2.5 px-4 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white text-sm font-medium transition-colors whitespace-nowrap"
-          >
-            {isRunning ? 'Пересчёт телеметрии...' : 'Пересчитать A/B через сервер'}
-          </button>
+                <div>
+                  <div className="flex justify-between text-xs font-medium text-slate-700 mb-1.5">
+                    <label htmlFor="slider-reviews">Итераций ревью (R)</label>
+                    <span className="font-mono tabular-nums text-slate-900">
+                      {simConfig.baselineReviewIters}
+                    </span>
+                  </div>
+                  <input
+                    id="slider-reviews"
+                    type="range"
+                    min={2}
+                    max={6}
+                    value={simConfig.baselineReviewIters}
+                    onChange={(e) =>
+                      onUpdateSimConfig({ baselineReviewIters: Number(e.target.value) })
+                    }
+                    className="w-full accent-blue-600 cursor-pointer"
+                  />
+                </div>
+
+                <div>
+                  <div className="flex justify-between text-xs font-medium text-slate-700 mb-1.5">
+                    <label htmlFor="slider-cache">Ожидаемый KV-Cache Hit</label>
+                    <span className="font-mono tabular-nums text-slate-900">
+                      {simConfig.kvCacheHitRatePct}%
+                    </span>
+                  </div>
+                  <input
+                    id="slider-cache"
+                    type="range"
+                    min={30}
+                    max={92}
+                    value={simConfig.kvCacheHitRatePct}
+                    onChange={(e) =>
+                      onUpdateSimConfig({ kvCacheHitRatePct: Number(e.target.value) })
+                    }
+                    className="w-full accent-blue-600 cursor-pointer"
+                  />
+                </div>
+              </div>
+
+              <div className="border-t border-slate-200 pt-4 space-y-2">
+                <div className="text-xs font-semibold text-slate-700">Модули SpecTrim</div>
+                {moduleToggles.map((mod) => {
+                  const checked = simConfig[mod.key];
+                  return (
+                    <label
+                      key={mod.key}
+                      className="flex items-start gap-2.5 cursor-pointer py-1 rounded-md hover:bg-slate-50 px-1.5 -mx-1.5"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={(e) => onUpdateSimConfig({ [mod.key]: e.target.checked })}
+                        className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-600"
+                      />
+                      <span className="text-xs leading-snug">
+                        <span className="font-medium text-slate-800 block">{mod.label}</span>
+                        <span className="text-slate-500">{mod.effect}</span>
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+
+              <button
+                type="button"
+                onClick={onRunServerSimulation}
+                className="w-full py-2 px-4 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-800 text-xs font-medium transition-colors whitespace-nowrap"
+              >
+                Пересчитать модель (simulated)
+              </button>
+            </>
+          ) : (
+            <div className="space-y-4">
+              <div>
+                <h2 className="text-lg font-semibold text-slate-900">Run Manifest & Parity</h2>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Подтверждение идентичности условий A/B
+                </p>
+              </div>
+              <dl className="divide-y divide-slate-100 text-xs">
+                <div className="py-2 flex justify-between gap-2">
+                  <dt className="text-slate-500">Base Commit</dt>
+                  <dd className="font-mono text-slate-900">{manifest.baseCommit.slice(0, 12)}</dd>
+                </div>
+                <div className="py-2 flex justify-between gap-2">
+                  <dt className="text-slate-500">Провайдер / Модель</dt>
+                  <dd className="font-mono text-slate-900">
+                    {manifest.provider} / {manifest.model}
+                  </dd>
+                </div>
+                <div className="py-2 flex justify-between gap-2">
+                  <dt className="text-slate-500">Changed files (B)</dt>
+                  <dd className="font-mono text-slate-900">{optimized.changedFiles.length}</dd>
+                </div>
+                <div className="py-2 flex justify-between gap-2">
+                  <dt className="text-slate-500">Diff lines (A vs B)</dt>
+                  <dd className="font-mono text-slate-900">
+                    {baseline.diffLineCount} vs {optimized.diffLineCount}
+                  </dd>
+                </div>
+                <div className="py-2 flex justify-between gap-2">
+                  <dt className="text-slate-500">Artifact consistency</dt>
+                  <dd className="font-mono text-emerald-700">
+                    {optimized.artifactConsistency ? 'PASS' : 'FAIL'}
+                  </dd>
+                </div>
+              </dl>
+              <div className="space-y-1">
+                <div className="text-xs font-medium text-slate-700">Сводка тестов SpecTrim:</div>
+                <pre className="bg-slate-900 text-slate-100 rounded-lg p-3 text-xs font-mono whitespace-pre-wrap max-h-48 overflow-y-auto">
+                  {optimized.testsOutputSummary}
+                </pre>
+              </div>
+            </div>
+          )}
         </div>
       </section>
 
-      {/* Detailed Stage Table + Input/Cached/Output Breakdown */}
+      {/* Detailed Stage Table */}
       <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
         <div className="px-6 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
           <h2 className="text-base font-semibold text-slate-900">
-            Детализация токенов: Input / Cached / Output по стадиям
+            Детализация токенов: Prompt / Cached / Completion по стадиям
           </h2>
           <span className="text-xs text-slate-500 tabular-nums">
-            Input −{totals.inputSavingsPct}% · Cached hit: {totals.optimizedCached.toLocaleString('ru-RU')} ток. · Output −{totals.outputSavingsPct}%
+            Prompt {savings.promptTokensPct !== null ? `−${savings.promptTokensPct}%` : 'n/a'} ·
+            Cached: {optimized.cachedInputTokens.toLocaleString('ru-RU')} · Completion{' '}
+            {savings.completionTokensPct !== null ? `−${savings.completionTokensPct}%` : 'n/a'}
           </span>
         </div>
         <div className="overflow-x-auto">
@@ -354,71 +724,76 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
             <thead>
               <tr className="border-b border-slate-200 bg-slate-50 text-xs font-medium text-slate-600">
                 <th className="py-3 px-4">Стадия SDD</th>
-                <th className="py-3 px-4 text-right">Baseline In</th>
+                <th className="py-3 px-4 text-right">Baseline Prompt</th>
                 <th className="py-3 px-4 text-right">Baseline Out</th>
                 <th className="py-3 px-4 text-right">Baseline Итого</th>
-                <th className="py-3 px-4 text-right">SpecTrim In</th>
-                <th className="py-3 px-4 text-right">Из них Cached</th>
+                <th className="py-3 px-4 text-right">SpecTrim Prompt</th>
+                <th className="py-3 px-4 text-right">Cached</th>
                 <th className="py-3 px-4 text-right">SpecTrim Out</th>
                 <th className="py-3 px-4 text-right">SpecTrim Итого</th>
                 <th className="py-3 px-4 text-right">Экономия</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 tabular-nums">
-              {stages.map((s) => (
-                <tr key={s.stage} className="hover:bg-slate-50/80 transition-colors">
-                  <td className="py-3 px-4 font-medium text-slate-900">{s.stageLabel}</td>
-                  <td className="py-3 px-4 text-right text-slate-600 font-mono text-xs">
-                    {s.baselineInput.toLocaleString('ru-RU')}
-                  </td>
-                  <td className="py-3 px-4 text-right text-slate-600 font-mono text-xs">
-                    {s.baselineOutput.toLocaleString('ru-RU')}
-                  </td>
-                  <td className="py-3 px-4 text-right text-slate-800 font-mono text-xs font-semibold">
-                    {s.baselineTotal.toLocaleString('ru-RU')}
-                  </td>
-                  <td className="py-3 px-4 text-right text-slate-700 font-mono text-xs">
-                    {s.optimizedInput.toLocaleString('ru-RU')}
-                  </td>
-                  <td className="py-3 px-4 text-right text-blue-700 font-mono text-xs">
-                    {s.optimizedCached.toLocaleString('ru-RU')}
-                  </td>
-                  <td className="py-3 px-4 text-right text-slate-700 font-mono text-xs">
-                    {s.optimizedOutput.toLocaleString('ru-RU')}
-                  </td>
-                  <td className="py-3 px-4 text-right text-slate-900 font-mono text-xs font-semibold">
-                    {s.optimizedTotal.toLocaleString('ru-RU')}
-                  </td>
-                  <td className="py-3 px-4 text-right font-mono text-xs font-semibold text-emerald-700">
-                    −{s.savingsPct}%
-                  </td>
-                </tr>
-              ))}
+              {baseline.stages.map((bs, idx) => {
+                const os = optimized.stages[idx];
+                if (!os) return null;
+                const stageSaving = pct(bs.totalTokens, os.totalTokens);
+                return (
+                  <tr key={bs.stage} className="hover:bg-slate-50/80 transition-colors">
+                    <td className="py-3 px-4 font-medium text-slate-900">{bs.stageLabel}</td>
+                    <td className="py-3 px-4 text-right text-slate-600 font-mono text-xs">
+                      {bs.promptTokens.toLocaleString('ru-RU')}
+                    </td>
+                    <td className="py-3 px-4 text-right text-slate-600 font-mono text-xs">
+                      {bs.completionTokens.toLocaleString('ru-RU')}
+                    </td>
+                    <td className="py-3 px-4 text-right text-slate-800 font-mono text-xs font-semibold">
+                      {bs.totalTokens.toLocaleString('ru-RU')}
+                    </td>
+                    <td className="py-3 px-4 text-right text-slate-700 font-mono text-xs">
+                      {os.promptTokens.toLocaleString('ru-RU')}
+                    </td>
+                    <td className="py-3 px-4 text-right text-blue-700 font-mono text-xs">
+                      {os.cachedInputTokens.toLocaleString('ru-RU')}
+                    </td>
+                    <td className="py-3 px-4 text-right text-slate-700 font-mono text-xs">
+                      {os.completionTokens.toLocaleString('ru-RU')}
+                    </td>
+                    <td className="py-3 px-4 text-right text-slate-900 font-mono text-xs font-semibold">
+                      {os.totalTokens.toLocaleString('ru-RU')}
+                    </td>
+                    <td className="py-3 px-4 text-right font-mono text-xs font-semibold text-emerald-700">
+                      −{stageSaving}%
+                    </td>
+                  </tr>
+                );
+              })}
               <tr className="bg-slate-50 font-semibold border-t border-slate-200">
                 <td className="py-3 px-4 text-slate-900">ИТОГО за фичу</td>
                 <td className="py-3 px-4 text-right font-mono text-xs text-slate-700">
-                  {totals.baselineInput.toLocaleString('ru-RU')}
+                  {baseline.promptTokens.toLocaleString('ru-RU')}
                 </td>
                 <td className="py-3 px-4 text-right font-mono text-xs text-slate-700">
-                  {totals.baselineOutput.toLocaleString('ru-RU')}
+                  {baseline.completionTokens.toLocaleString('ru-RU')}
                 </td>
                 <td className="py-3 px-4 text-right font-mono text-xs text-slate-900">
-                  {totals.baselineTotal.toLocaleString('ru-RU')}
+                  {baseline.totalTokens.toLocaleString('ru-RU')}
                 </td>
                 <td className="py-3 px-4 text-right font-mono text-xs text-slate-800">
-                  {totals.optimizedInput.toLocaleString('ru-RU')}
+                  {optimized.promptTokens.toLocaleString('ru-RU')}
                 </td>
                 <td className="py-3 px-4 text-right font-mono text-xs text-blue-700">
-                  {totals.optimizedCached.toLocaleString('ru-RU')}
+                  {optimized.cachedInputTokens.toLocaleString('ru-RU')}
                 </td>
                 <td className="py-3 px-4 text-right font-mono text-xs text-slate-800">
-                  {totals.optimizedOutput.toLocaleString('ru-RU')}
+                  {optimized.completionTokens.toLocaleString('ru-RU')}
                 </td>
                 <td className="py-3 px-4 text-right font-mono text-xs text-slate-900">
-                  {totals.optimizedTotal.toLocaleString('ru-RU')}
+                  {optimized.totalTokens.toLocaleString('ru-RU')}
                 </td>
                 <td className="py-3 px-4 text-right font-mono text-xs text-emerald-700">
-                  −{totals.totalSavingsPct}%
+                  {savings.totalTokensPct !== null ? `−${savings.totalTokensPct}%` : 'n/a'}
                 </td>
               </tr>
             </tbody>
@@ -436,7 +811,7 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
             </h2>
           </div>
           <span className="text-xs text-slate-500">
-            Динамический хвост вынесен в конец — префиксные 1–4 слоты не инвалидируются
+            Динамический хвост вынесен в конец — префиксные 1–4 слоты стабильны
           </span>
         </div>
         <div className="grid grid-cols-1 md:grid-cols-5 gap-3">

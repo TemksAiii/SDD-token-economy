@@ -5,7 +5,7 @@ import {
   compressTestLog,
   deduplicateFileReads,
 } from './outputCompressor';
-import { DEMO_RAW_GIT_DIFF, DEMO_RAW_PYTEST_LOG } from '../data/demoWorkspace';
+import { DEMO_RAW_GIT_DIFF, DEMO_RAW_PYTEST_LOG } from '../data/demoFixtures';
 
 test('compressTestLog strips passing tests and site-packages while retaining failure assertion', () => {
   const res = compressTestLog(DEMO_RAW_PYTEST_LOG, 'pytest');

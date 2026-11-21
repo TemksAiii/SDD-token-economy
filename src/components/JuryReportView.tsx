@@ -1,17 +1,19 @@
 import React, { useState } from 'react';
+import { AbRunReport } from '../engine/provenance';
 import { JuryDeliverablesBundle } from '../engine/juryDeliverables';
+import { PROVENANCE_LABEL } from '../types/workbench';
 import { Check, Copy, Download } from 'lucide-react';
 
 interface JuryReportViewProps {
+  report: AbRunReport;
   deliverables: JuryDeliverablesBundle;
-  metricsJsonl: string;
 }
 
-type DocTab = 'report' | 'demo' | 'slides' | 'opencode' | 'metrics';
+type DocTab = 'report' | 'repro' | 'demo' | 'slides' | 'opencode' | 'manifest' | 'metrics' | 'diffs';
 
 export const JuryReportView: React.FC<JuryReportViewProps> = ({
+  report,
   deliverables,
-  metricsJsonl,
 }) => {
   const [activeDoc, setActiveDoc] = useState<DocTab>('report');
   const [copied, setCopied] = useState<boolean>(false);
@@ -21,6 +23,11 @@ export const JuryReportView: React.FC<JuryReportViewProps> = ({
       title: 'REPORT.md — Аналитический отчёт для жюри',
       filename: 'REPORT.md',
       content: deliverables.reportMd,
+    },
+    repro: {
+      title: 'REPRODUCIBILITY.md — Инструкция воспроизведения CLI и A/B worktree',
+      filename: 'REPRODUCIBILITY.md',
+      content: deliverables.reproducibilityMd,
     },
     demo: {
       title: 'DEMO_SCRIPT.md — Сценарий видео-демонстрации (3:30)',
@@ -37,10 +44,20 @@ export const JuryReportView: React.FC<JuryReportViewProps> = ({
       filename: 'spectrim-plugin.ts',
       content: `${deliverables.openCodePluginTs}\n\n${deliverables.agentsMdSnippet}`,
     },
+    manifest: {
+      title: 'run_manifest.json — Манифест идентичности A/B-прогона',
+      filename: 'run_manifest.json',
+      content: JSON.stringify(report.manifest, null, 2),
+    },
     metrics: {
-      title: 'metrics.jsonl — Сырой поток телеметрии A/B-прогона',
+      title: 'metrics.jsonl — Построчная телеметрия A/B-прогона',
       filename: 'metrics.jsonl',
-      content: metricsJsonl,
+      content: report.metricsJsonl,
+    },
+    diffs: {
+      title: 'baseline.diff & optimized.diff — Диффы изолированных worktree',
+      filename: 'ab-diffs.patch',
+      content: `=== BASELINE DIFF ===\n${report.baselineDiff}\n\n=== SPECTRIM (OPTIMIZED) DIFF ===\n${report.optimizedDiff}`,
     },
   };
 
@@ -70,25 +87,28 @@ export const JuryReportView: React.FC<JuryReportViewProps> = ({
 
   const tabs: Array<{ id: DocTab; label: string }> = [
     { id: 'report', label: 'REPORT.md' },
+    { id: 'repro', label: 'REPRODUCIBILITY.md' },
     { id: 'demo', label: 'DEMO_SCRIPT.md' },
     { id: 'slides', label: 'PITCH_SLIDES.md' },
     { id: 'opencode', label: 'OpenCode Plugin' },
+    { id: 'manifest', label: 'run_manifest.json' },
     { id: 'metrics', label: 'metrics.jsonl' },
+    { id: 'diffs', label: 'git diff' },
   ];
 
   return (
     <div className="space-y-6">
       <div className="border-b border-slate-200 pb-5 space-y-2">
         <div className="text-xs text-slate-500">
-          Синхронизировано с текущими параметрами A/B-эксперимента
+          {PROVENANCE_LABEL[report.provenance]} · Run ID: {report.manifest.runId}
         </div>
         <h1 className="text-2xl font-bold tracking-tight text-slate-900">
-          Итоговый пакет артефактов для жюри СберТеха
+          Артефакты отчёта и воспроизводимости
         </h1>
         <p className="text-sm text-slate-600 max-w-3xl">
-          Все цифры в отчёте, раскадровке видео, слайдах и потоке{' '}
-          <code className="font-mono text-xs bg-slate-100 px-1.5 py-0.5 rounded">metrics.jsonl</code>{' '}
-          автоматически пересчитываются из живого A/B-стенда.
+          Все документы,{' '}
+          <code className="font-mono text-xs bg-slate-100 px-1.5 py-0.5 rounded">run_manifest.json</code>,{' '}
+          <code className="font-mono text-xs bg-slate-100 px-1.5 py-0.5 rounded">metrics.jsonl</code> и diff-артефакты синхронизированы с активным отчётом и явно указывают его provenance.
         </p>
       </div>
 
@@ -101,7 +121,7 @@ export const JuryReportView: React.FC<JuryReportViewProps> = ({
               aria-selected={activeDoc === tab.id}
               type="button"
               onClick={() => setActiveDoc(tab.id)}
-              className={`px-3.5 py-2 text-xs font-mono font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
+              className={`px-3 py-2 text-xs font-mono font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
                 activeDoc === tab.id
                   ? 'bg-blue-600 text-white border-blue-600'
                   : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'

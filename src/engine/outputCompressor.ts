@@ -1,6 +1,6 @@
 import { estimateTokens, shortBlockHash } from './tokens';
 
-export type TestRunnerKind = 'pytest' | 'vitest' | 'go_test';
+export type TestRunnerKind = 'pytest' | 'unittest' | 'vitest' | 'node_test' | 'go_test' | 'junit';
 
 export interface CompressedOutputResult {
   compressed: string;
@@ -52,20 +52,26 @@ export function compressTestLog(
     // Strip ANSI escape codes & progress indicators
     const clean = line.replace(/\x1b\[[0-9;]*m/g, '');
 
-    if (/^\s*(PASSED|ok\s+|\.\.\.\s+ok|✓|\s*\[[0-9/]+\]|platform |rootdir:|collecting|cachedir:|plugins:)/.test(clean)) {
+    if (
+      /^\s*(PASSED|ok\s+\d+|ok\s+[^-]|✓|\s*\[[0-9/]+\]|platform |rootdir:|collecting|cachedir:|plugins:|TAP version|duration_ms:|type:\s*'test'|\.\.\.$)/.test(
+        clean
+      ) ||
+      / \.\.\. ok$/.test(clean)
+    ) {
       continue;
     }
 
     if (
-      /^(FAILED|FAIL|AssertionError|E\s+assert|Error:|panic:|---\s+FAIL:|×\s+|Expected:|Received:)/.test(
+      /^(FAILED|FAIL|not ok \d+|AssertionError|ERR_ASSERTION|E\s+assert|Error:|panic:|---\s+FAIL:|×\s+|Expected:|Received:)/.test(
         trimmed
       ) ||
       trimmed.includes('FAILED ') ||
-      trimmed.includes('AssertionError')
+      trimmed.includes('AssertionError') ||
+      trimmed.includes('ERR_ASSERTION')
     ) {
       inFailureBlock = true;
       failureContextBudget = 12;
-      if (/^(FAILED|---\s+FAIL:|×\s+)/.test(trimmed)) {
+      if (/^(FAILED|not ok \d+|---\s+FAIL:|×\s+)/.test(trimmed)) {
         detectedFailures.push(trimmed);
       }
       kept.push(clean);
@@ -73,11 +79,12 @@ export function compressTestLog(
     }
 
     if (inFailureBlock) {
-      // Skip noisy third-party site-packages / node_modules stack frames
+      // Skip noisy third-party site-packages / node_modules / internal node test_runner stack frames
       if (
         clean.includes('site-packages/') ||
         clean.includes('node_modules/') ||
-        clean.includes('/usr/lib/')
+        clean.includes('/usr/lib/') ||
+        clean.includes('node:internal/test_runner')
       ) {
         continue;
       }
@@ -92,7 +99,7 @@ export function compressTestLog(
 
     // Keep final summary line
     if (
-      /\d+\s+(passed|failed)|Test Files\s+\d+|FAIL\s+\w+|PASS\s+\w+|short test summary/i.test(
+      /\d+\s+(passed|failed)|Test Files\s+\d+|FAIL\s+\w+|PASS\s+\w+|short test summary|# tests \d+|# pass \d+|# fail \d+|Ran \d+ tests? in/i.test(
         trimmed
       )
     ) {
