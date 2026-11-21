@@ -1,9 +1,16 @@
 #!/usr/bin/env node
+import 'dotenv/config';
 import fs from 'node:fs';
 import { parseOpenSpecBundle, sliceSpecForTask } from '../src/engine/specSlicer';
 import { compressGitDiff, compressTestLog, TestRunnerKind } from '../src/engine/outputCompressor';
-import { detectRepoOnDisk, readOpenSpecBundleFromDisk } from '../src/runtime/repoFs';
+import { LlmProviderId } from '../src/engine/provenance';
+import {
+  detectRepoOnDisk,
+  listWorkspaceBenchmarkRepos,
+  readOpenSpecBundleFromDisk,
+} from '../src/runtime/repoFs';
 import { runLocalPreReviewGate } from '../src/runtime/localGateRunner';
+import { getProviderStatusAsync } from '../src/runtime/llmProvider';
 import { runRealAbWorktreeBenchmark } from '../src/runtime/abWorktreeRunner';
 import { resolveConfinedPath } from '../src/runtime/pathGuard';
 
@@ -11,12 +18,13 @@ function printUsage() {
   console.log(`SpecTrim CLI — Token-Efficient SDD Pipeline
 
 Usage:
+  spectrim status
   spectrim detect <repoPath>
   spectrim inspect <repoPath> <changeId>
   spectrim slice <repoPath> <changeId> [--task TSK-01] [--completed TSK-01,TSK-02]
   spectrim gate <repoPath> <changeId>
   spectrim compress --kind <test|diff> [--runner node_test|pytest|unittest|vitest|go_test] <filePath>
-  spectrim bench <repoPath> <changeId> [--provider gemini|openai_compat] [--model gemini-4-hydrogen] [--reviews 3]
+  spectrim bench <repoPath> <changeId> [--provider gemini|ollama|openai_compat] [--model gemini-4-hydrogen] [--reviews 3]
 `);
 }
 
@@ -33,6 +41,13 @@ async function main() {
   if (!cmd || cmd === '--help' || cmd === '-h') {
     printUsage();
     process.exit(0);
+  }
+
+  if (cmd === 'status') {
+    const provider = await getProviderStatusAsync();
+    const repos = listWorkspaceBenchmarkRepos();
+    console.log(JSON.stringify({ provider, repos }, null, 2));
+    return;
   }
 
   if (cmd === 'detect') {
@@ -86,7 +101,19 @@ async function main() {
   if (cmd === 'bench') {
     const repoPath = args[1] || 'benchmarks/orders-ts';
     const changeId = args[2] || 'add-idempotency-and-webhooks';
-    const provider = getFlag(args, '--provider') as 'gemini' | 'openai_compat' | undefined;
+    const rawProvider = getFlag(args, '--provider');
+    if (
+      rawProvider &&
+      rawProvider !== 'gemini' &&
+      rawProvider !== 'ollama' &&
+      rawProvider !== 'openai_compat'
+    ) {
+      console.error(
+        `Invalid --provider "${rawProvider}". Allowed values: gemini, ollama, openai_compat`
+      );
+      process.exit(1);
+    }
+    const provider = rawProvider as LlmProviderId | undefined;
     const model = getFlag(args, '--model');
     const reviews = Number(getFlag(args, '--reviews') || '3');
 

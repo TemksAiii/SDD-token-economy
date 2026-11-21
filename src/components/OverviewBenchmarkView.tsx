@@ -6,7 +6,8 @@ import {
   SimulationConfig,
   WorkbenchStatusResponse,
 } from '../types/workbench';
-import { AlertTriangle, Check, GitBranch, Layers, ShieldCheck, Square } from 'lucide-react';
+import { AlertTriangle, Check, GitBranch, Layers, RefreshCw, ShieldCheck, Square } from 'lucide-react';
+import { LlmProviderId } from '../engine/provenance';
 
 interface OverviewBenchmarkViewProps {
   activeData: ActiveBenchmarkState;
@@ -22,8 +23,11 @@ interface OverviewBenchmarkViewProps {
   onChangeRepoPath: (repo: string) => void;
   selectedChangeId: string;
   onChangeChangeId: (changeId: string) => void;
+  selectedProvider: LlmProviderId;
+  onChangeProvider: (provider: LlmProviderId) => void;
   selectedModel: string;
   onChangeModel: (model: string) => void;
+  onRefreshStatus: () => void;
   maxReviewIters: number;
   onChangeMaxReviewIters: (iters: number) => void;
   isRunningReal: boolean;
@@ -48,8 +52,11 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
   onChangeRepoPath,
   selectedChangeId,
   onChangeChangeId,
+  selectedProvider,
+  onChangeProvider,
   selectedModel,
   onChangeModel,
+  onRefreshStatus,
   maxReviewIters,
   onChangeMaxReviewIters,
   isRunningReal,
@@ -72,10 +79,38 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
   const gitRepos = (status?.repos ?? []).filter((r) => r.isGitRepo && r.changes.length > 0);
   const currentRepo =
     gitRepos.find((r) => r.repoPath === selectedRepoPath) ?? gitRepos[0] ?? null;
-  const availableModels = status?.provider.availableModels ?? [];
-  const providerReady = Boolean(
-    status && status.provider.defaultProvider !== 'none' && availableModels.length > 0
+  const allAvailableModels = status?.provider.availableModels ?? [];
+  const modelsForSelectedProvider = allAvailableModels.filter(
+    (m) => m.provider === selectedProvider
   );
+  const selectedProviderReady =
+    selectedProvider === 'gemini'
+      ? Boolean(status?.provider.geminiConfigured)
+      : selectedProvider === 'ollama'
+      ? Boolean(status?.provider.ollamaConfigured)
+      : Boolean(status?.provider.openAiCompatConfigured);
+
+  const selectedProviderHint = (() => {
+    if (!status) return 'Проверка окружения сервера...';
+    if (selectedProvider === 'gemini') {
+      return status.provider.geminiConfigured
+        ? 'Облачный провайдер Gemini готов (GEMINI_API_KEY активен; флагман: gemini-4-hydrogen).'
+        : 'GEMINI_API_KEY не задан на сервере. Добавьте его в .env (или Settings > Secrets) либо переключитесь на локальную Ollama без API-ключа.';
+    }
+    if (selectedProvider === 'ollama') {
+      const ol = status.provider.ollamaStatus;
+      if (ol.reachable && ol.installedModels.length > 0) {
+        return `Локальная Ollama готова (${ol.baseUrl}, без API-ключа). Найдено моделей: ${ol.installedModels.length}. Стоимость в USD = n/a; API cacheUsageMeasured = false.`;
+      }
+      return (
+        ol.error ||
+        `Локальная Ollama недоступна (${ol.baseUrl}). Запустите \`ollama serve\` и скачайте модель: \`ollama pull qwen2.5-coder:7b\`.`
+      );
+    }
+    return status.provider.openAiCompatConfigured
+      ? 'OpenAI-compatible endpoint готов к работе.'
+      : 'OPENAI_COMPAT_BASE_URL / OPENAI_COMPAT_API_KEY не заданы в .env.';
+  })();
 
   const moduleToggles: Array<{
     key: keyof Pick<
@@ -182,9 +217,14 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
         }`}
       >
         <div className="flex flex-wrap items-center justify-between gap-2 font-semibold">
-          <span>Достоверность активного отчёта: {PROVENANCE_LABEL[provenance]}</span>
+          <span>
+            Достоверность активного отчёта:{' '}
+            {provenance === 'measured' && manifest.provider === 'ollama'
+              ? 'MEASURED · Локальная Ollama + Git Worktree (без API-ключа)'
+              : PROVENANCE_LABEL[provenance]}
+          </span>
           <span className="font-mono text-slate-700">
-            runId: {manifest.runId} · commit:{' '}
+            provider: {manifest.provider} · runId: {manifest.runId} · commit:{' '}
             {manifest.baseCommit.length > 12
               ? manifest.baseCommit.slice(0, 10)
               : manifest.baseCommit}
@@ -218,8 +258,8 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
           </div>
 
           {status && status.savedRuns.length > 0 && (
-            <div className="flex items-center gap-2 shrink-0">
-              <label htmlFor="saved-run-select" className="text-xs font-medium text-slate-600">
+            <div className="flex flex-col sm:flex-row sm:items-center gap-1.5 sm:gap-2 min-w-0 w-full md:w-auto">
+              <label htmlFor="saved-run-select" className="text-xs font-medium text-slate-600 shrink-0">
                 Сохранённые прогоны:
               </label>
               <select
@@ -228,7 +268,7 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
                 onChange={(e) => {
                   if (e.target.value) void onLoadSavedRun(e.target.value);
                 }}
-                className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-mono text-slate-900"
+                className="w-full md:w-auto max-w-full min-w-0 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-mono text-slate-900"
               >
                 <option value="">Выберите прогон...</option>
                 {status.savedRuns.map((r) => (
@@ -241,8 +281,8 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
           )}
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          <div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-4">
+          <div className="lg:col-span-2">
             <label htmlFor="ab-repo" className="block text-xs font-medium text-slate-700 mb-1">
               Git-репозиторий
             </label>
@@ -265,7 +305,7 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
             </select>
           </div>
 
-          <div>
+          <div className="lg:col-span-2">
             <label htmlFor="ab-change" className="block text-xs font-medium text-slate-700 mb-1">
               OpenSpec Change
             </label>
@@ -286,32 +326,9 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
             </select>
           </div>
 
-          <div>
-            <label htmlFor="ab-model" className="block text-xs font-medium text-slate-700 mb-1">
-              Единая модель (A и B)
-            </label>
-            <select
-              id="ab-model"
-              value={selectedModel}
-              onChange={(e) => onChangeModel(e.target.value)}
-              disabled={!providerReady || isRunningReal}
-              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-mono text-slate-900 disabled:bg-slate-100 disabled:text-slate-500"
-            >
-              {providerReady ? (
-                availableModels.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.label}
-                  </option>
-                ))
-              ) : (
-                <option value="">Ключ провайдера не задан на сервере</option>
-              )}
-            </select>
-          </div>
-
-          <div>
+          <div className="lg:col-span-2">
             <label htmlFor="ab-reviews" className="block text-xs font-medium text-slate-700 mb-1">
-              Макс. итераций ревью в Baseline
+              Итераций ревью (Baseline)
             </label>
             <select
               id="ab-reviews"
@@ -327,13 +344,76 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
               ))}
             </select>
           </div>
+
+          <div className="lg:col-span-3">
+            <label htmlFor="ab-provider" className="block text-xs font-medium text-slate-700 mb-1">
+              Провайдер (A и B)
+            </label>
+            <select
+              id="ab-provider"
+              value={selectedProvider}
+              onChange={(e) => onChangeProvider(e.target.value as LlmProviderId)}
+              disabled={statusLoading || isRunningReal}
+              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-mono text-slate-900"
+            >
+              <option value="gemini">
+                gemini ({status?.provider.geminiConfigured ? 'готов · облачный флагман' : 'нет ключа'})
+              </option>
+              <option value="ollama">
+                ollama ({status?.provider.ollamaConfigured ? 'готов · локально без ключа' : 'локально без API-ключа'})
+              </option>
+              <option value="openai_compat">
+                openai_compat ({status?.provider.openAiCompatConfigured ? 'готов' : 'не задан'})
+              </option>
+            </select>
+          </div>
+
+          <div className="sm:col-span-2 lg:col-span-3">
+            <label htmlFor="ab-model" className="block text-xs font-medium text-slate-700 mb-1">
+              Единая модель (A и B)
+            </label>
+            <select
+              id="ab-model"
+              value={selectedModel}
+              onChange={(e) => onChangeModel(e.target.value)}
+              disabled={!selectedProviderReady || isRunningReal}
+              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-mono text-slate-900 disabled:bg-slate-100 disabled:text-slate-500"
+            >
+              {selectedProviderReady ? (
+                modelsForSelectedProvider.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                  </option>
+                ))
+              ) : selectedProvider === 'gemini' ? (
+                <option value="gemini-4-hydrogen">Требуется GEMINI_API_KEY</option>
+              ) : selectedProvider === 'ollama' ? (
+                <option value={selectedModel || 'qwen2.5-coder:7b'}>
+                  {status?.provider.ollamaStatus.reachable
+                    ? 'Нет скачанных моделей (ollama pull)'
+                    : 'Ollama не запущена (ollama serve)'}
+                </option>
+              ) : (
+                <option value="">Не настроен OPENAI_COMPAT_*</option>
+              )}
+            </select>
+          </div>
         </div>
 
         <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
-          <div className="text-xs text-slate-600">
-            {status?.provider.limitationNote ?? 'Проверка окружения сервера...'}
+          <div className="text-xs text-slate-600 max-w-2xl">
+            {selectedProviderHint}
           </div>
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+            <button
+              type="button"
+              onClick={onRefreshStatus}
+              disabled={isRunningReal}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-60 text-slate-700 text-xs font-medium transition-colors whitespace-nowrap"
+            >
+              <RefreshCw className="w-3.5 h-3.5" aria-hidden="true" />
+              Обновить статус
+            </button>
             {isRunningReal && (
               <button
                 type="button"

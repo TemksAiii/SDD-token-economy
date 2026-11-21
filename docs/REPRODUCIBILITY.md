@@ -8,8 +8,8 @@
 
 ## 2. Достоверность данных (Data Provenance)
 Каждая метрика и отчёт строго маркируются:
-- `measured` — получены из реального прогона `git worktree` + `usageMetadata` API провайдера + реальных тестов и `git diff`.
-- `measured_local` — реальный запуск тестов, линтера, `git`, подсчёт AST/срезов на диске без вызова внешнего LLM API.
+- `measured` — получены из реального прогона `git worktree` + реальных счётчиков токенов провайдера (облачный Gemini `usageMetadata` или локальная Ollama `prompt_eval_count`/`eval_count`) + реальных тестов и `git diff`.
+- `measured_local` — реальный запуск тестов, линтера, `git`, подсчёт AST/срезов на диске без вызова LLM.
 - `estimated` — оценка токенизации текста без ответа провайдера.
 - `simulated` / `demo_fixture` — локальная математическая симуляция или fixture-пример; никогда не выдаётся за `measured`.
 
@@ -18,7 +18,13 @@
 npm run lint
 npm test
 npm run build
+npm run spectrim -- status
 npm run spectrim -- detect benchmarks/orders-ts
 npm run spectrim -- gate benchmarks/orders-ts add-rate-limit-and-audit
-npm run spectrim -- bench benchmarks/orders-ts add-idempotency-and-webhooks --model gemini-4-hydrogen
+
+# Облачный флагман (нужен GEMINI_API_KEY)
+npm run spectrim -- bench benchmarks/orders-ts add-idempotency-and-webhooks --provider gemini --model gemini-4-hydrogen
+
+# Локальный запуск через Ollama (без API-ключа)
+npm run spectrim -- bench benchmarks/orders-ts add-idempotency-and-webhooks --provider ollama --model qwen2.5-coder:7b
 ```

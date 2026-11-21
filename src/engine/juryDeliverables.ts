@@ -13,7 +13,9 @@ export function generateJuryDeliverables(report: AbRunReport): JuryDeliverablesB
   const { manifest, baseline, optimized, savings, provenance, limitations } = report;
   const provBadge =
     provenance === 'measured'
-      ? 'MEASURED (Реальные замеры API провайдера + git worktree + тесты)'
+      ? manifest.provider === 'ollama'
+        ? 'MEASURED (Локальный инференс Ollama + git worktree + реальные тесты, без API-ключа)'
+        : 'MEASURED (Реальные замеры API провайдера + git worktree + тесты)'
       : provenance === 'measured_local'
       ? 'MEASURED_LOCAL (Локальные замеры токенизации и реальные тесты без LLM API)'
       : 'SIMULATED / DEMO FIXTURE (Локальная симуляция — НЕ является измеренным доказательством)';
@@ -72,14 +74,18 @@ ${stageRows}
   const reproducibilityMd = `# Воспроизводимость и запуск SpecTrim CLI / A/B Benchmark
 
 ## 1. Требования к окружению
-- Node.js >= 20, \`git\`, \`python3\` (для Python-полигона)
-- Ключ провайдера в переменных окружения сервера:
-  - \`GEMINI_API_KEY\` (для Google Gemini через \`@google/genai\`, по умолчанию модель \`gemini-4-hydrogen\`)
-  - или \`OPENAI_COMPAT_BASE_URL\` + \`OPENAI_COMPAT_API_KEY\` + \`OPENAI_COMPAT_MODEL\` (для OpenAI-compatible / локальных vLLM / SGLang / OpenRouter провайдеров)
+- Node.js >= 22.12, \`git\`, \`python3\` (для Python-полигона)
+- Провайдер моделей для реального A/B-прогона (строго один и тот же для Baseline и SpecTrim):
+  - **Основной облачный флагман**: \`GEMINI_API_KEY\` в \`.env\` или Settings > Secrets (модель по умолчанию \`gemini-4-hydrogen\`)
+  - **Опционально локально без API-ключа**: установленная **Ollama** (\`ollama serve\` + \`ollama pull qwen2.5-coder:7b\`, адрес \`OLLAMA_BASE_URL=http://127.0.0.1:11434\`)
+  - **Опционально OpenAI-compatible**: \`OPENAI_COMPAT_BASE_URL\` + \`OPENAI_COMPAT_API_KEY\` + \`OPENAI_COMPAT_MODEL\`
 
 ## 2. Запуск CLI поверх любого репозитория
 
 \`\`\`bash
+# 0. Проверка готовности провайдеров (Gemini / Ollama) и доступных полигонов
+npm run spectrim -- status
+
 # 1. Автоопределение стека и команд по манифесту
 npm run spectrim -- detect benchmarks/orders-ts
 npm run spectrim -- detect benchmarks/orders-py
@@ -95,8 +101,11 @@ npm run spectrim -- slice benchmarks/orders-ts add-rate-limit-and-audit --task T
 # 4. Запуск Zero-Token Pre-Review Gate (реальные тесты + tsc/lint + @spec:REQ-XX + консистентность)
 npm run spectrim -- gate benchmarks/orders-ts add-rate-limit-and-audit
 
-# 5. Честный A/B worktree-прогон (создаёт worktree-baseline и worktree-optimized от одного baseCommit)
-npm run spectrim -- bench benchmarks/orders-ts add-idempotency-and-webhooks --model gemini-4-hydrogen
+# 5a. Облачный A/B worktree-прогон (основной флагман Gemini Hydrogen)
+npm run spectrim -- bench benchmarks/orders-ts add-idempotency-and-webhooks --provider gemini --model gemini-4-hydrogen
+
+# 5b. Локальный A/B worktree-прогон через Ollama (без API-ключа)
+npm run spectrim -- bench benchmarks/orders-ts add-idempotency-and-webhooks --provider ollama --model qwen2.5-coder:7b
 \`\`\`
 
 ## 3. Артефакты воспроизводимого запуска

@@ -331,8 +331,8 @@ export function runLocalSimulation(
     },
     provenance: 'simulated',
     limitations: [
-      'Это ЛОКАЛЬНАЯ МАТЕМАТИЧЕСКАЯ СИМУЛЯЦИЯ (provenance: simulated). Она НЕ является измеренным доказательством экономии через API провайдера.',
-      'Для получения достоверных данных provenance: measured запустите реальный A/B worktree-прогон с настроенным GEMINI_API_KEY или OpenAI-compatible endpoint.',
+      'Это ЛОКАЛЬНАЯ МАТЕМАТИЧЕСКАЯ СИМУЛЯЦИЯ (provenance: simulated). Она НЕ является измеренным доказательством экономии через API или локальную модель.',
+      'Для получения реальных замеров (provenance: measured) запустите A/B worktree-прогон с GEMINI_API_KEY (облачный флагман Gemini Hydrogen), локальной Ollama (без API-ключа) или OpenAI-compatible endpoint.',
     ],
     baseline,
     optimized,

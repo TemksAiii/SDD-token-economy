@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -31,7 +32,7 @@ import {
   readRepoFile,
 } from './src/runtime/repoFs';
 import { runLocalPreReviewGate } from './src/runtime/localGateRunner';
-import { getProviderStatus } from './src/runtime/llmProvider';
+import { getProviderStatusAsync } from './src/runtime/llmProvider';
 import {
   BenchmarkProgressEvent,
   listSavedRuns,
@@ -68,10 +69,11 @@ async function startServer() {
   });
 
   // Provider readiness + real disk repositories + saved runs
-  app.get('/api/status', (_req, res) => {
+  app.get('/api/status', async (_req, res) => {
     try {
+      const provider = await getProviderStatusAsync();
       res.json({
-        provider: getProviderStatus(),
+        provider,
         repos: listWorkspaceBenchmarkRepos(),
         savedRuns: listSavedRuns(),
       });
@@ -357,7 +359,7 @@ async function startServer() {
   });
 
   // Start real isolated git worktree A/B benchmark with AbortController + SSE progress
-  app.post('/api/runs/start', (req, res) => {
+  app.post('/api/runs/start', async (req, res) => {
     try {
       const {
         repoPath = 'benchmarks/orders-ts',
@@ -367,11 +369,50 @@ async function startServer() {
         maxReviewIters = 3,
       } = req.body ?? {};
 
-      const status = getProviderStatus();
-      if (status.defaultProvider === 'none') {
+      const status = await getProviderStatusAsync();
+      const targetProvider = provider || status.defaultProvider;
+
+      if (targetProvider === 'none') {
         return res.status(400).json({
           code: 'PROVIDER_NOT_CONFIGURED',
           error: status.limitationNote,
+        });
+      }
+      if (targetProvider === 'gemini' && !status.geminiConfigured) {
+        return res.status(400).json({
+          code: 'PROVIDER_NOT_CONFIGURED',
+          error:
+            'Выбран провайдер Gemini, но GEMINI_API_KEY не задан в .env или Settings > Secrets.',
+        });
+      }
+      if (targetProvider === 'ollama') {
+        if (!status.ollamaStatus.enabled) {
+          return res.status(400).json({
+            code: 'PROVIDER_NOT_CONFIGURED',
+            error: 'Ollama отключена в настройках сервера (OLLAMA_ENABLED=false).',
+          });
+        }
+        if (!status.ollamaStatus.reachable) {
+          return res.status(400).json({
+            code: 'PROVIDER_NOT_CONFIGURED',
+            error:
+              status.ollamaStatus.error ||
+              `Локальная Ollama недоступна (${status.ollamaStatus.baseUrl}). Запустите: ollama serve`,
+          });
+        }
+        if (status.ollamaStatus.installedModels.length === 0 && !model) {
+          return res.status(400).json({
+            code: 'PROVIDER_NOT_CONFIGURED',
+            error:
+              'В Ollama не установлено ни одной модели. Выполните: ollama pull qwen2.5-coder:7b',
+          });
+        }
+      }
+      if (targetProvider === 'openai_compat' && !status.openAiCompatConfigured) {
+        return res.status(400).json({
+          code: 'PROVIDER_NOT_CONFIGURED',
+          error:
+            'Выбран провайдер openai_compat, но OPENAI_COMPAT_BASE_URL / OPENAI_COMPAT_API_KEY не настроены.',
         });
       }
 

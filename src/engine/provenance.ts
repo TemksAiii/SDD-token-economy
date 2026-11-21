@@ -114,15 +114,29 @@ export interface AbRunReport {
   metricsJsonl: string;
 }
 
+export type LlmProviderId = 'gemini' | 'ollama' | 'openai_compat';
+
+export interface OllamaDiscoveryStatus {
+  enabled: boolean;
+  reachable: boolean;
+  baseUrl: string;
+  configuredModel: string | null;
+  installedModels: string[];
+  error?: string;
+}
+
 export interface ProviderStatus {
   geminiConfigured: boolean;
+  ollamaConfigured: boolean;
   openAiCompatConfigured: boolean;
-  defaultProvider: 'gemini' | 'openai_compat' | 'none';
+  defaultProvider: LlmProviderId | 'none';
+  ollamaStatus: OllamaDiscoveryStatus;
   availableModels: Array<{
     id: string;
     label: string;
-    provider: 'gemini' | 'openai_compat';
+    provider: LlmProviderId;
     tier: 'small' | 'large';
+    locality: 'cloud' | 'local';
   }>;
   limitationNote: string;
 }

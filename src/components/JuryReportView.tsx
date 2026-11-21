@@ -100,7 +100,10 @@ export const JuryReportView: React.FC<JuryReportViewProps> = ({
     <div className="space-y-6">
       <div className="border-b border-slate-200 pb-5 space-y-2">
         <div className="text-xs text-slate-500">
-          {PROVENANCE_LABEL[report.provenance]} · Run ID: {report.manifest.runId}
+          {report.provenance === 'measured' && report.manifest.provider === 'ollama'
+            ? 'MEASURED · Локальная Ollama + Git Worktree (без API-ключа)'
+            : PROVENANCE_LABEL[report.provenance]}{' '}
+          · {report.manifest.provider} / {report.manifest.model} · Run ID: {report.manifest.runId}
         </div>
         <h1 className="text-2xl font-bold tracking-tight text-slate-900">
           Артефакты отчёта и воспроизводимости

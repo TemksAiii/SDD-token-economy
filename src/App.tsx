@@ -20,6 +20,7 @@ import {
   LiveRunProgressEvent,
   WorkbenchStatusResponse,
 } from './types/workbench';
+import { LlmProviderId } from './engine/provenance';
 
 type AppPage = 'overview' | 'modules' | 'portability' | 'report';
 
@@ -35,10 +36,8 @@ export default function App() {
 
   const [selectedRepoPath, setSelectedRepoPath] = useState<string>('benchmarks/orders-ts');
   const [selectedChangeId, setSelectedChangeId] = useState<string>('add-idempotency-and-webhooks');
+  const [selectedProvider, setSelectedProvider] = useState<LlmProviderId>('gemini');
   const [selectedModel, setSelectedModel] = useState<string>('gemini-4-hydrogen');
-  const [selectedProvider, setSelectedProvider] = useState<'gemini' | 'openai_compat' | undefined>(
-    undefined
-  );
   const [maxReviewIters, setMaxReviewIters] = useState<number>(3);
 
   const [simConfig, setSimConfig] = useState<SimulationConfig>(DEFAULT_SIMULATION_CONFIG);
@@ -57,13 +56,29 @@ export default function App() {
       if (!resp.ok) return;
       const data = (await resp.json()) as WorkbenchStatusResponse;
       setStatus(data);
-      if (data.provider.availableModels.length > 0) {
-        const first = data.provider.availableModels[0];
-        setSelectedModel((prev) =>
-          data.provider.availableModels.some((m) => m.id === prev) ? prev : first.id
-        );
-        setSelectedProvider(first.provider);
+
+      const models = data.provider.availableModels;
+      if (models.length > 0) {
+        const defaultProv: LlmProviderId =
+          data.provider.defaultProvider !== 'none'
+            ? data.provider.defaultProvider
+            : models[0].provider;
+        setSelectedProvider((prevProv) => {
+          const hasPrevProvModels = models.some((m) => m.provider === prevProv);
+          const nextProv = hasPrevProvModels ? prevProv : defaultProv;
+          const provModels = models.filter((m) => m.provider === nextProv);
+          setSelectedModel((prevModel) =>
+            provModels.some((m) => m.id === prevModel)
+              ? prevModel
+              : provModels[0]?.id ?? 'gemini-4-hydrogen'
+          );
+          return nextProv;
+        });
+      } else if (data.provider.ollamaStatus.reachable) {
+        setSelectedProvider('ollama');
+        setSelectedModel(data.provider.ollamaStatus.configuredModel || 'qwen2.5-coder:7b');
       }
+
       if (data.savedRuns.length > 0 && !measuredState) {
         try {
           const runResp = await fetch(`/api/runs/${encodeURIComponent(data.savedRuns[0].runId)}`);
@@ -352,12 +367,33 @@ export default function App() {
             }}
             selectedChangeId={selectedChangeId}
             onChangeChangeId={setSelectedChangeId}
+            selectedProvider={selectedProvider}
+            onChangeProvider={(prov) => {
+              setSelectedProvider(prov);
+              setRunError(null);
+              const modelsForProv =
+                status?.provider.availableModels.filter((m) => m.provider === prov) ?? [];
+              if (modelsForProv.length > 0) {
+                setSelectedModel(modelsForProv[0].id);
+              } else if (prov === 'gemini') {
+                setSelectedModel('gemini-4-hydrogen');
+              } else if (prov === 'ollama') {
+                setSelectedModel(
+                  status?.provider.ollamaStatus.configuredModel || 'qwen2.5-coder:7b'
+                );
+              } else {
+                setSelectedModel('');
+              }
+            }}
             selectedModel={selectedModel}
             onChangeModel={(modelId) => {
               setSelectedModel(modelId);
-              const found = status?.provider.availableModels.find((m) => m.id === modelId);
+              const found = status?.provider.availableModels.find(
+                (m) => m.id === modelId && m.provider === selectedProvider
+              );
               if (found) setSelectedProvider(found.provider);
             }}
+            onRefreshStatus={() => void refreshStatus()}
             maxReviewIters={maxReviewIters}
             onChangeMaxReviewIters={setMaxReviewIters}
             isRunningReal={isRunningReal}

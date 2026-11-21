@@ -1,279 +1,318 @@
 # SpecTrim SDD Workbench
 
-Интерактивный стенд для оценки и демонстрации методов оптимизации расхода токенов в Spec-Driven Development: Spec Slicer, AST-LOD & Hashline, Log Compressor, Zero-Token Pre-Review Gate и A/B-бенчмарк.
+Инженерная система и интерактивный стенд для снижения расхода токенов в **Spec-Driven Development (SDD / OpenSpec)** при сохранении качества: 100% покрытие требований `@spec:REQ-XX` в коде и тестах, проходящие тесты и линтер, согласованность `proposal / specs / design / tasks`, а также **одинаковая модель и провайдер** для Baseline и SpecTrim внутри каждого A/B-эксперимента.
 
-Проект запускается как веб-приложение с Express-сервером и Vite на порту `3000`.
+Веб-интерфейс и API работают на Express + Vite (порт `3000`), а CLI `spectrim` позволяет запускать все проверки и изолированные `git worktree` A/B-прогоны прямо из терминала.
 
-## Требования
+---
 
-- Node.js 22.12 или новее
-- npm 10 или новее
-- Git
+## Что работает без внешнего LLM-ключа, а что требует модель
 
-Проверить установку:
+| Режим | Что выполняется | Нужен ли LLM / API-ключ | Provenance |
+| --- | --- | --- | --- |
+| **Инспекция OpenSpec, Spec Slicer, AST-LOD & Hashline, Zero-Token Gate, Портативность** | Чтение реальных файлов в `benchmarks/*`, построение AST-скелетов, запуск реальных тестов (`tsx --test`, `tsc --noEmit`, `python3 -m unittest`) и `git` | **Нет** | `measured_local` |
+| **Математическая симуляция и Ablation Study** | Расчётная модель $O(N^2) \to O(N)$ по настраиваемым параметрам (K задач, R ревью, тумблеры модулей) | **Нет** | `simulated` |
+| **Реальный A/B worktree-прогон с облачным флагманом Gemini** | Два изолированных `git worktree` от одного commit SHA, Baseline vs SpecTrim на **Gemini Hydrogen** (`gemini-4-hydrogen`), реальный `usageMetadata` | Нужен `GEMINI_API_KEY` | `measured` |
+| **Реальный A/B worktree-прогон локально через Ollama** | Два изолированных `git worktree` от одного commit SHA, Baseline vs SpecTrim на локальной модели (например `qwen2.5-coder:7b`), счётчики `prompt_eval_count` / `eval_count` | **API-ключ не нужен** (нужна локальная Ollama) | `measured` |
 
-```powershell
+---
+
+## 1. Системные требования и зависимости
+
+Обязательные инструменты:
+- **Node.js** `>= 22.12`
+- **npm** `>= 10`
+- **Git** (обязателен для A/B-сравнения через `git worktree`)
+
+Опционально:
+- **Python 3** — для запуска реальных `unittest`-проверок полигона `benchmarks/orders-py`
+- **Go / Maven** — для запуска тестов Go/Java-проектов (автодетект манифестов и AST-LOD работают и без них)
+- **Ollama** — для локальных A/B-замеров без облачного API-ключа
+
+Проверка версий в терминале:
+
+```bash
 node --version
 npm --version
 git --version
+python3 --version
 ```
 
-Если Node.js отсутствует, установите актуальную LTS-версию с официального сайта:
+Установка npm-зависимостей (используйте `npm install`, lockfile в репозитории не зафиксирован):
 
-- https://nodejs.org/
-
-Для Windows также можно установить Node.js через `winget`:
-
-```powershell
-winget install OpenJS.NodeJS.LTS
-```
-
-После установки откройте новый терминал, чтобы обновлённый `PATH` стал доступен.
-
-## Установка
-
-### 1. Клонировать репозиторий
-
-```powershell
-git clone https://github.com/lLightly/SDD-token-economy.git
-cd SDD-token-economy
-```
-
-Если репозиторий уже клонирован, перейдите в его каталог:
-
-```powershell
-cd путь\к\SDD-token-economy
-```
-
-### 2. Установить зависимости
-
-В корне проекта выполните:
-
-```powershell
+```bash
 npm install
 ```
 
-Файла блокировки зависимостей в репозитории нет, поэтому для обычной локальной установки используется `npm install`.
+---
 
-### 3. Настроить переменные окружения
+## 2. Настройка `.env` и провайдеров
 
-Для текущего локального запуска переменные окружения не обязательны: приложение использует встроенный демо-набор данных и локальные API Express.
+Сервер (`server.ts`) и CLI (`bin/spectrim.ts`) автоматически загружают `.env` через `dotenv/config`. Создайте локальный `.env` из шаблона:
 
-Файл `.env.example` сохранён для совместимости со средой Google AI Studio. При необходимости создать локальный `.env`:
+```bash
+# Linux / macOS
+cp .env.example .env
 
-```powershell
+# Windows PowerShell
 Copy-Item .env.example .env
 ```
 
-Затем при необходимости замените значения в `.env`:
+Содержимое `.env.example`:
 
 ```dotenv
-GEMINI_API_KEY="ваш_ключ"
+# Основной облачный флагман для жюри (Gemini Hydrogen)
+GEMINI_API_KEY="MY_GEMINI_API_KEY"
 APP_URL="http://localhost:3000"
+
+# Опциональный локальный провайдер Ollama (API-ключ не требуется)
+OLLAMA_ENABLED="true"
+OLLAMA_BASE_URL="http://127.0.0.1:11434"
+OLLAMA_MODEL="qwen2.5-coder:7b"
+
+# Опциональный OpenAI-compatible endpoint (OpenCode / vLLM / OpenRouter)
+OPENAI_COMPAT_BASE_URL=
+OPENAI_COMPAT_API_KEY=
+OPENAI_COMPAT_MODEL=
 ```
 
-Ключ Gemini API для локального запуска без Google AI Studio не используется сервером `server.ts`.
+### Вариант A: Основной облачный флагман — Gemini Hydrogen
 
-## Запуск в режиме разработки
+Для эталонного облачного A/B-прогона с `gemini-4-hydrogen` (или быстрой `gemini-3.1-flash-lite`):
+1. Укажите `GEMINI_API_KEY="ваш_ключ"` в `.env` (либо в Google AI Studio: **Settings → Secrets**).
+2. При наличии `GEMINI_API_KEY` провайдер `gemini` и модель `gemini-4-hydrogen` автоматически выбираются по умолчанию.
 
-Из корня проекта выполните:
+### Вариант B: Локальная проверка без API-ключа — Ollama
 
-```powershell
+Если облачного ключа нет или вы хотите воспроизвести реальный worktree A/B-прогон полностью локально:
+
+1. **Установите Ollama**: https://ollama.com/download
+2. **Запустите сервис Ollama** (если не запущен как фоновая служба):
+   ```bash
+   ollama serve
+   ```
+3. **Скачайте локальную coding-модель** (рекомендуемый старт для ноутбуков с 8–16 ГБ RAM):
+   ```bash
+   ollama pull qwen2.5-coder:7b
+   ```
+4. **Проверьте, что модель доступна**:
+   ```bash
+   ollama list
+   curl http://127.0.0.1:11434/api/tags
+   ```
+   В Windows PowerShell вместо `curl`:
+   ```powershell
+   Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags"
+   ```
+5. **Проверьте, что SpecTrim видит Ollama**:
+   ```bash
+   npm run spectrim -- status
+   ```
+   При активной Ollama (`http://127.0.0.1:11434`) и загруженной модели `qwen2.5-coder:7b` в выводе появится `"ollamaConfigured": true` и список установленных моделей. **Никакой фиктивный API-ключ для Ollama не нужен.**
+
+---
+
+## 3. Локальный запуск веб-приложения
+
+### Режим разработки
+
+```bash
 npm run dev
 ```
 
-Затем откройте в браузере:
+Откройте в браузере:
+- Приложение: `http://localhost:3000`
+- Проверка здоровья сервера: `http://localhost:3000/api/health` (ожидается `{"status":"ok","service":"spectrim-sdd-workbench"}`)
 
-- http://localhost:3000
-- Проверка сервера: http://localhost:3000/api/health
+### Production-сборка и запуск
 
-Ожидаемый ответ проверки сервера:
-
-```json
-{
-  "status": "ok",
-  "service": "spectrim-sdd-workbench"
-}
+Linux / macOS:
+```bash
+npm run build
+NODE_ENV=production npm start
 ```
 
-Для остановки сервера нажмите `Ctrl+C` в терминале.
-
-## Запуск production-сборки локально
-
-### Windows PowerShell
-
+Windows PowerShell:
 ```powershell
 npm run build
 $env:NODE_ENV="production"
 npm start
 ```
 
-### Windows Command Prompt
-
+Windows Command Prompt:
 ```bat
 npm run build
 set NODE_ENV=production
 npm start
 ```
 
-### macOS или Linux
+---
+
+## 4. Запуск A/B-бенчмарка: через UI и через CLI
+
+### Через веб-интерфейс (`http://localhost:3000`)
+
+1. Откройте вкладку **«Обзор A/B»**.
+2. В блоке **«Реальный A/B-прогон в изолированных git worktree»** выберите:
+   - **Git-репозиторий** (например, `benchmarks/orders-ts`)
+   - **OpenSpec Change** (например, `add-idempotency-and-webhooks` — 8 невыполненных задач)
+   - **Провайдер (A и B)**: `gemini` (облачный флагман) или `ollama` (локально без API-ключа)
+   - **Единая модель (A и B)**: например `gemini-4-hydrogen` или `qwen2.5-coder:7b` (если Ollama запущена после открытия страницы, нажмите **«Обновить статус»**)
+   - **Итераций ревью (Baseline)** (1–5)
+3. Нажмите **«Запустить реальный worktree A/B»**. Прогресс транслируется по SSE, а по завершении отчёт автоматически переключается в режим **«Реальный A/B»** (`provenance: measured`).
+4. Нажмите на вкладку **«Отчёт жюри»**, чтобы просмотреть и скачать `REPORT.md`, `run_manifest.json`, `metrics.jsonl` и `baseline.diff` / `optimized.diff`.
+
+### Через CLI (`npm run spectrim -- ...`)
 
 ```bash
-npm run build
-NODE_ENV=production npm start
+# Проверить готовность провайдеров (Gemini / Ollama) и найденные полигоны
+npm run spectrim -- status
+
+# Автоопределение стека и команд тестирования по манифесту
+npm run spectrim -- detect benchmarks/orders-ts
+npm run spectrim -- detect benchmarks/orders-py
+npm run spectrim -- detect benchmarks/edge-go
+npm run spectrim -- detect benchmarks/billing-java
+
+# Инспекция OpenSpec-графа REQ -> DES -> TSK
+npm run spectrim -- inspect benchmarks/orders-ts add-rate-limit-and-audit
+
+# Построение task-scoped среза спеки и State Capsule для конкретной задачи
+npm run spectrim -- slice benchmarks/orders-ts add-rate-limit-and-audit --task TSK-07
+
+# Запуск Zero-Token Pre-Review Gate (реальные тесты + tsc/lint + @spec:REQ-XX + консистентность)
+npm run spectrim -- gate benchmarks/orders-ts add-rate-limit-and-audit
+
+# Облачный A/B-прогон на основном флагмане Gemini Hydrogen
+npm run spectrim -- bench benchmarks/orders-ts add-idempotency-and-webhooks --provider gemini --model gemini-4-hydrogen
+
+# Локальный A/B-прогон через Ollama без API-ключа
+npm run spectrim -- bench benchmarks/orders-ts add-idempotency-and-webhooks --provider ollama --model qwen2.5-coder:7b
 ```
 
-Приложение снова будет доступно по адресу http://localhost:3000.
+Артефакты каждого реального прогона сохраняются на диск в `.spectrim-runs/<runId>/`:
+- `run_manifest.json` — `baseCommit`, провайдер, единая модель, команды тестов/линтера, пути worktree
+- `metrics.jsonl` — построчная телеметрия каждого вызова LLM с `provenance`
+- `baseline.diff` и `optimized.diff` — реальные `git diff` из изолированных worktree
+- `summary.json` и `REPORT.md` — сводная таблица Before/After и результаты проверок качества
 
-Production-сборка берётся из каталога `dist`. Не удаляйте этот каталог до запуска сервера в production-режиме.
+### Какие метрики читать после прогона
 
-## Основные команды
+- `promptTokens`, `completionTokens`, `totalTokens` — реальные счётчики токенов от провайдера (`usageMetadata` у Gemini или `prompt_eval_count` / `eval_count` у Ollama).
+- `costUsd` — расчётная стоимость в USD по таблице тарифов (`gemini-4-hydrogen`, `gemini-3.1-flash-lite`); для локальной Ollama и неизвестных моделей честно выводится `n/a`.
+- `cacheUsageMeasured` и `cachedInputTokens` — подтверждённый провайдером кэш промпта (для Ollama `false` / `0`, так как `/api/chat` не возвращает счётчик API-кэша).
+- `testsPassed`, `lintPassed`, `reqCoveragePct`, `artifactConsistency` — реальная проверка качества в worktree.
 
-| Команда | Назначение |
-| --- | --- |
-| `npm run dev` | Запустить сервер разработки с Vite middleware |
-| `npm start` | Запустить Express-сервер |
-| `npm run build` | Собрать production-версию в `dist/` |
-| `npm run preview` | Запустить отдельный preview-сервер Vite для сборки |
-| `npm run lint` | Проверить TypeScript с помощью `tsc --noEmit` |
-| `npm run clean` | Удалить `dist/` и `server.js` |
+---
 
-## Проверка проекта
+## 5. Проверка проекта: тесты, типы и сборка
 
-Проверить типы:
-
-```powershell
+```bash
+# Проверка типов TypeScript (tsc --noEmit)
 npm run lint
-```
 
-Запустить unit-тесты движков:
+# Все unit- и runtime-тесты движков и адаптеров провайдеров
+npm test
 
-```powershell
-npx tsx --test "src/**/*.test.ts"
-```
-
-Собрать production-сборку:
-
-```powershell
+# Production-сборка фронтенда (dist/)
 npm run build
 ```
 
-Тестовые файлы находятся в каталоге `src/engine/` и покрывают:
+Тесты находятся в `src/engine/*.test.ts` и `src/runtime/*.test.ts` и проверяют:
+- `specSlicer`, `astLodHashline` (TypeScript, Python, Go, Java), `outputCompressor`, `preReviewGate`, `portability`, `abModelSimulation`;
+- `pathGuard`, `repoFs` (реальные полигоны в `benchmarks/`), `localGateRunner` (реальный запуск `tsx --test`, `tsc --noEmit` и `python3 -m unittest`);
+- `llmProvider` (проверка схем URL, discovery `/api/tags`, разбор `prompt_eval_count`/`eval_count` в `/api/chat`, обработка 404, отказ от фабрикации отсутствующих счётчиков, корректный отказ при недоступном сервере).
 
-- A/B-бенчмарк;
-- AST-LOD и Hashline;
-- Spec Slicer;
-- Pre-Review Gate;
-- компрессор вывода;
-- определение переносимости репозиториев.
+---
 
-## Доступные API
-
-Все API доступны на том же хосте и порту, что и веб-интерфейс.
+## 6. Доступные HTTP API (`http://localhost:3000`)
 
 | Метод | Путь | Назначение |
 | --- | --- | --- |
 | `GET` | `/api/health` | Проверка работоспособности сервера |
-| `POST` | `/api/benchmark` | Запуск A/B-бенчмарка |
-| `POST` | `/api/slice` | Слайсинг OpenSpec-конфигурации |
-| `POST` | `/api/ast-lod` | Построение AST-LOD представления |
-| `POST` | `/api/hashline-patch` | Применение Hashline-патча |
-| `POST` | `/api/compress` | Сжатие git diff или тестового вывода |
-| `POST` | `/api/gate` | Проверка Pre-Review Gate |
-| `GET` | `/api/portability` | Анализ переносимости демо-репозиториев |
+| `GET` | `/api/status` | Статус провайдеров (Gemini, Ollama `/api/tags`, OpenAI-compat), список git-полигонов и сохранённых прогонов |
+| `POST` | `/api/simulation` | Пересчёт математической симуляции (`provenance: simulated`) |
+| `GET` | `/api/fs/portability` | Реальный анализ манифестов и AST-сжатия на полигонах `benchmarks/*` |
+| `GET` | `/api/fs/inspect` | Чтение и разбор графа OpenSpec с диска (`?repo=...&change=...`) |
+| `POST` | `/api/fs/slice` | Task-scoped срез спеки и State Capsule по реальным файлам |
+| `POST` | `/api/fs/ast-lod` | Построение `LOD0` (Hashline) / `LOD1` (AST-скелет) / `LOD2` по файлу на диске |
+| `POST` | `/api/hashline-patch` | Применение range-патча с проверкой `L{n}#{hash}` |
+| `POST` | `/api/compress` | Сжатие `git diff` или логов тестов |
+| `POST` | `/api/fs/gate` | Запуск Zero-Token Pre-Review Gate поверх реального репозитория |
+| `GET` | `/api/runs` | Список завершённых прогонов в `.spectrim-runs/` |
+| `GET` | `/api/runs/:runId` | Загрузка `summary.json` и deliverables конкретного прогона |
+| `POST` | `/api/runs/start` | Запуск изолированного A/B worktree-прогона (`{ repoPath, changeId, provider, model, maxReviewIters }`) |
+| `GET` | `/api/runs/jobs/:jobId/stream` | SSE-поток прогресса выполняющегося A/B-прогона |
+| `POST` | `/api/runs/jobs/:jobId/cancel` | Отмена активного A/B-прогона через `AbortController` |
 
-Пример проверки health API:
+---
 
-```powershell
-Invoke-RestMethod -Uri "http://localhost:3000/api/health"
-```
-
-Через `curl`:
-
-```bash
-curl http://localhost:3000/api/health
-```
-
-## Как пользоваться приложением
-
-1. Откройте http://localhost:3000.
-2. На странице «Обзор A/B» настройте параметры и запустите бенчмарк.
-3. Откройте «Модули SpecTrim», чтобы посмотреть отдельные компоненты оптимизации.
-4. На странице «Портативность» изучите анализ поддержки языков репозитория.
-5. На странице «Отчёт жюри» получите метрики и сформированные deliverables.
-
-В приложении используются встроенные демо-данные из `src/data/demoWorkspace.ts`; для основных сценариев внешняя база данных или отдельный сервер не нужны.
-
-## Структура проекта
+## 7. Структура репозитория
 
 ```text
 .
+├── bin/
+│   └── spectrim.ts              # CLI (status, detect, inspect, slice, gate, compress, bench)
+├── benchmarks/
+│   ├── orders-ts/               # Git-полигон TypeScript (node:test + tsc)
+│   ├── orders-py/               # Git-полигон Python (unittest)
+│   ├── edge-go/                 # Полигон Go (go.mod)
+│   └── billing-java/            # Полигон Java (pom.xml)
+├── docs/
+│   └── REPRODUCIBILITY.md       # Краткая памятка по воспроизводимости и provenance
 ├── src/
-│   ├── components/       # React-компоненты страниц
-│   ├── data/             # Демо-наборы и исходные спецификации
-│   ├── engine/           # Логика бенчмарка и модулей
-│   ├── App.tsx           # Корневой React-компонент
-│   ├── index.css         # Глобальные стили
-│   └── main.tsx          # Точка входа React
-├── server.ts             # Express-сервер и API
-├── vite.config.ts        # Конфигурация Vite
-├── package.json          # Скрипты и зависимости
-├── tsconfig.json         # Настройки TypeScript
-└── index.html            # HTML-шаблон приложения
+│   ├── components/              # UI: Обзор A/B, Модули, Портативность, Отчёт жюри
+│   ├── data/                    # Встроенные sample-фильтры логов/diff для Sandbox
+│   ├── engine/                  # Детерминированные модули, симуляция, типы provenance
+│   ├── runtime/                 # Безопасная работа с ФС, gate, llmProvider (Gemini/Ollama), worktree A/B
+│   ├── types/                   # Контракты UI
+│   ├── App.tsx
+│   └── main.tsx
+├── server.ts                    # Express-сервер, Vite middleware и REST/SSE API
+├── AGENTS.md                    # Политика SDD-воркфлоу для агентов
+├── .env.example
+└── package.json
 ```
 
-## Решение типичных проблем
+---
 
-### Порт 3000 занят
+## 8. Достоверность данных (Provenance) и ограничения Ollama
 
-По умолчанию сервер использует фиксированный порт `3000`. Если процесс не запускается из-за занятости порта, найдите и остановите процесс, который занимает порт.
+В интерфейсе, JSON-отчётах и `REPORT.md` данные строго разделяются:
+- **`measured` (облачный API, например `gemini-4-hydrogen`)**: реальные worktree + реальный `usageMetadata` API + реальные тесты и `git diff`.
+- **`measured` (локальная `ollama`)**: реальные worktree + реальные `prompt_eval_count`/`eval_count` локального сервера + реальные тесты и `git diff`. **Важные ограничения локальных моделей Ollama**:
+  1. `costUsd` всегда равен `n/a` (локальный инференс не имеет тарифа облачного API).
+  2. `cacheUsageMeasured` равен `false` (`cachedInputTokens = 0`), так как Ollama `/api/chat` не отдаёт счётчик кэшированных токенов.
+  3. Компактные локальные модели (например 7B–8B) могут чаще допускать ошибки формата JSON или недописывать `@spec:REQ-XX` — SpecTrim честно отразит это в `retries`, `testsPassed`, `lintPassed` и `reqCoveragePct` без подделки зелёных галочек. Для эталонного сравнения на жюри используйте облачный флагман `gemini-4-hydrogen`.
+- **`measured_local`**: реальные измерения на диске (размер файлов, AST-срезы, выполнение тестов/линтера) без обращения к LLM.
+- **`simulated`**: расчёт математической модели — наглядно иллюстрирует формулы $O(N^2) \to O(N)$, но не подменяет измеренный A/B-прогон.
+- **`demo_fixture`**: встроенные образцы логов и диффов в песочнице модулей.
 
-Windows PowerShell:
+---
 
-```powershell
-Get-NetTCPConnection -LocalPort 3000 -State Listen
-```
+## 9. Решение типичных проблем
 
-Linux/macOS:
+### Ollama не отвечает (`Ollama не отвечает по адресу http://127.0.0.1:11434`)
+1. Убедитесь, что Ollama запущена: `ollama serve`.
+2. Если Ollama работает на другом порту или хосте (например в Docker/WSL), укажите адрес в `.env`:
+   ```dotenv
+   OLLAMA_BASE_URL="http://127.0.0.1:11434"
+   ```
+3. Перезапустите `npm run dev` или нажмите **«Обновить статус»** в UI.
 
-```bash
-lsof -i :3000
-```
+### Модель не найдена в Ollama (`Модель "..." не найдена в Ollama`)
+1. Посмотрите список установленных моделей: `ollama list`.
+2. Скачайте нужную модель: `ollama pull qwen2.5-coder:7b`.
+3. Убедитесь, что имя модели вместе с тегом (`:7b` и т.д.) совпадает с выбранным в UI или переданным в `--model`.
 
-Чтобы изменить порт, укажите новое значение в константе `PORT` в `server.ts`:
+### Ошибка провайдера Gemini (`GEMINI_API_KEY не задан`)
+1. Для облачного A/B-прогона добавьте `GEMINI_API_KEY="..."` в `.env` и перезапустите сервер.
+2. Либо переключите выпадающий список **«Провайдер (A и B)»** на `ollama` для бесплатного локального прогона без ключа.
 
-```ts
-const PORT = 3000;
-```
+### Порт `3000` занят
+Найдите и остановите процесс, слушающий порт `3000`:
+- Linux / macOS: `lsof -i :3000`
+- Windows PowerShell: `Get-NetTCPConnection -LocalPort 3000 -State Listen`
 
-### Команда `npm` не найдена
-
-1. Установите Node.js LTS.
-2. Закройте и снова откройте терминал.
-3. Проверьте `node --version` и `npm --version`.
-
-### Зависимости не устанавливаются
-
-Удалите локальную папку зависимостей и установите их заново:
-
-```powershell
-Remove-Item -Recurse -Force node_modules -ErrorAction SilentlyContinue
-npm install
-```
-
-На macOS/Linux:
-
-```bash
-rm -rf node_modules
-npm install
-```
-
-### Production-сервер показывает только пустую страницу
-
-Сначала выполните сборку:
-
-```powershell
-npm run build
-```
-
-Убедитесь, что каталог `dist/` создан, затем запустите сервер с переменной `NODE_ENV=production`.
+### Прогон benchmark или Zero-Token Gate завершился с ошибкой качества (`FAIL`)
+Это ожидаемое честное поведение, если тестируемая модель пропустила маркер `@spec:REQ-XX`, сломала синтаксис или не прошла тесты в worktree. Откройте вкладку **«Отчёт жюри» → `baseline.diff` / `optimized.diff`**, либо проверьте репозиторий вручную через `npm run spectrim -- gate <repo> <changeId>`.

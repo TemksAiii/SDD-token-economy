@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   AbRunReport,
+  LlmProviderId,
   PipelineSideSummary,
   RunManifest,
   SddStage,
@@ -29,12 +30,12 @@ import {
   writeRepoFileConfined,
 } from './repoFs';
 import { runSafeCommand, splitCommandArgs } from './execUtils';
-import { callLlmWithUsage, getProviderStatus } from './llmProvider';
+import { callLlmWithUsage, getProviderStatusAsync } from './llmProvider';
 
 export interface StartAbBenchmarkOptions {
   repoPath: string;
   changeId: string;
-  provider?: 'gemini' | 'openai_compat';
+  provider?: LlmProviderId;
   model?: string;
   maxReviewIters?: number;
   signal?: AbortSignal;
@@ -217,20 +218,51 @@ export function loadSavedRun(runId: string): AbRunReport {
 export async function runRealAbWorktreeBenchmark(
   opts: StartAbBenchmarkOptions
 ): Promise<AbRunReport> {
-  const providerStatus = getProviderStatus();
+  const providerStatus = await getProviderStatusAsync();
   const selectedProvider =
     opts.provider ??
     (providerStatus.defaultProvider === 'none' ? null : providerStatus.defaultProvider);
 
   if (!selectedProvider) {
     throw new Error(
-      'Провайдер LLM не настроен: задайте GEMINI_API_KEY в Settings > Secrets (или OPENAI_COMPAT_* в .env) для реального A/B-замера.'
+      'Провайдер LLM не настроен: задайте GEMINI_API_KEY в Settings > Secrets/.env или запустите локальную Ollama (ollama serve + ollama pull qwen2.5-coder:7b) без API-ключа.'
+    );
+  }
+
+  if (selectedProvider === 'gemini' && !providerStatus.geminiConfigured) {
+    throw new Error(
+      'Выбран провайдер Gemini, но GEMINI_API_KEY не задан в .env или Settings > Secrets.'
+    );
+  }
+  if (selectedProvider === 'ollama') {
+    if (!providerStatus.ollamaStatus.enabled) {
+      throw new Error('Провайдер Ollama отключён через OLLAMA_ENABLED=false.');
+    }
+    if (!providerStatus.ollamaStatus.reachable) {
+      throw new Error(
+        providerStatus.ollamaStatus.error ||
+          `Локальный сервер Ollama недоступен (${providerStatus.ollamaStatus.baseUrl}). Запустите: ollama serve`
+      );
+    }
+    if (providerStatus.ollamaStatus.installedModels.length === 0 && !opts.model?.trim()) {
+      throw new Error(
+        'В Ollama не установлено ни одной модели. Скачайте модель: ollama pull qwen2.5-coder:7b'
+      );
+    }
+  }
+  if (selectedProvider === 'openai_compat' && !providerStatus.openAiCompatConfigured) {
+    throw new Error(
+      'Выбран провайдер openai_compat, но OPENAI_COMPAT_BASE_URL / OPENAI_COMPAT_API_KEY не настроены.'
     );
   }
 
   const defaultModel =
     selectedProvider === 'gemini'
       ? 'gemini-4-hydrogen'
+      : selectedProvider === 'ollama'
+      ? providerStatus.ollamaStatus.configuredModel ||
+        providerStatus.ollamaStatus.installedModels[0] ||
+        'qwen2.5-coder:7b'
       : process.env.OPENAI_COMPAT_MODEL?.trim() || 'custom-model';
   const model = opts.model?.trim() || defaultModel;
   const maxReviewIters = Math.max(1, Math.min(5, opts.maxReviewIters ?? 3));
@@ -487,6 +519,7 @@ ${accumulatedHistory}`;
         edits?: Array<{ path: string; content: string }>;
       }>(revResp.text);
 
+      const revRetries = parsedRev ? 0 : 1;
       if (parsedRev?.edits) {
         for (const edit of parsedRev.edits) {
           if (edit.path && typeof edit.content === 'string') {
@@ -494,7 +527,7 @@ ${accumulatedHistory}`;
           }
         }
       }
-      recordUsage('baseline', 'review', `REV-${iter}`, baseAcc.review, revResp, 4, 0, iter);
+      recordUsage('baseline', 'review', `REV-${iter}`, baseAcc.review, revResp, 4, revRetries, iter);
       if (parsedRev?.approved && checks.testRes.exitCode === 0 && checks.lintRes.exitCode === 0) {
         break;
       }
@@ -579,6 +612,9 @@ ${accumulatedHistory}`;
       }>(resp.text);
 
       let retries = 0;
+      if (!parsed) {
+        retries += 1;
+      }
       if (parsed?.hashline_patches) {
         for (const p of parsed.hashline_patches) {
           if (!p.path) continue;
@@ -800,15 +836,27 @@ ${accumulatedHistory}`;
     manifest.status = 'completed';
 
     const limitations: string[] = [];
-    if (!optimizedSummary.cacheUsageMeasured) {
+    if (selectedProvider === 'ollama') {
       limitations.push(
-        'Провайдер не вернул ненулевой cachedContentTokenCount для данного размера промпта; cachedInputTokens зафиксированы как 0 без домысливания.'
+        `Локальный прогон через Ollama (${providerStatus.ollamaStatus.baseUrl}, модель ${model}): prompt_eval_count и eval_count измерены локальным сервером без API-ключа; денежная стоимость равна n/a (нет облачного биллинга).`
       );
-    }
-    if (baselineSummary.costUsd === null || optimizedSummary.costUsd === null) {
       limitations.push(
-        `Тариф модели ${model} отсутствует в локальной таблице цен — стоимость в USD отмечена как n/a.`
+        'Ollama /api/chat не возвращает отдельный счётчик API-кэша (cachedInputTokens = 0, cacheUsageMeasured = false), поэтому KV-Cache prefix здесь влияет на локальную скорость, но не отражается в поле cachedInputTokens.'
       );
+      limitations.push(
+        'Качество кода, @spec:REQ-XX и прохождение тестов зависят от выбранной локальной модели и её квантизации; эталонным облачным прогоном для жюри остаётся Gemini Hydrogen.'
+      );
+    } else {
+      if (!optimizedSummary.cacheUsageMeasured) {
+        limitations.push(
+          'Провайдер не вернул ненулевой cachedContentTokenCount для данного размера промпта; cachedInputTokens зафиксированы как 0 без домысливания.'
+        );
+      }
+      if (baselineSummary.costUsd === null || optimizedSummary.costUsd === null) {
+        limitations.push(
+          `Тариф модели ${model} отсутствует в локальной таблице цен — стоимость в USD отмечена как n/a.`
+        );
+      }
     }
 
     const metricsJsonl = telemetry.map((t) => JSON.stringify(t)).join('\n');
@@ -853,7 +901,10 @@ ${accumulatedHistory}`;
     fs.writeFileSync(path.join(runDir, 'summary.json'), JSON.stringify(report, null, 2));
     fs.writeFileSync(path.join(runDir, 'REPORT.md'), deliverables.reportMd);
 
-    emit('done', `Прогон ${runId} завершён. Экономия: ${report.savings.totalTokensPct ?? 0}% (measured).`);
+    emit(
+      'done',
+      `Прогон ${runId} (${selectedProvider} / ${model}) завершён. Экономия: ${report.savings.totalTokensPct ?? 0}% (measured).`
+    );
     return report;
   } catch (err) {
     const aborted = opts.signal?.aborted || (err instanceof Error && err.message.includes('aborted'));
