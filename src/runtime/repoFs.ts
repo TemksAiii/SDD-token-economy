@@ -78,7 +78,7 @@ export function inspectGitContext(absRepo: string): GitContextInfo {
     const absGitRoot = fs.realpathSync(path.resolve(rawTop));
     const realAbsRepo = fs.realpathSync(absRepo);
 
-    const headCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
+    const headCommit = execFileSync('git', ['rev-parse', '--verify', 'HEAD^{commit}'], {
       cwd: absGitRoot,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
@@ -119,49 +119,56 @@ export function inspectGitContext(absRepo: string): GitContextInfo {
   }
 }
 
+export const SNAPSHOT_POLICY = {
+  algorithm: 'sha256',
+  format: 'spectrim-tree-v2',
+  entries: 'Sorted relative directories and regular files. Hashes framed paths, entry kinds, file lengths, executable bits and bytes.',
+  excludedNames: [...SKIP_DIRS, 'coverage', '.DS_Store'],
+  excludedPatterns: ['.env and .env.* except .env.example', 'symbolic links and other special files'],
+} as const;
+
+function* snapshotEntries(root: string, dir = root): Generator<{ relative: string; directory: boolean }> {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (SNAPSHOT_POLICY.excludedNames.includes(entry.name) ||
+      (entry.name !== '.env.example' && /^\.env(?:\.|$)/.test(entry.name))) continue;
+    const full = path.join(dir, entry.name);
+    if (!entry.isDirectory() && !entry.isFile()) continue;
+    yield { relative: path.relative(root, full), directory: entry.isDirectory() };
+    if (entry.isDirectory()) yield* snapshotEntries(root, full);
+  }
+}
+
 export function computeRepoSnapshotHash(absRepo: string): string {
-  const hash = crypto.createHash('sha256');
-  const filePaths: string[] = [];
-
-  const walk = (dir: string) => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (SKIP_DIRS.has(entry.name)) continue;
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walk(full);
-      } else if (entry.isFile()) {
-        filePaths.push(path.relative(absRepo, full).replace(/\\/g, '/'));
-      }
+  const hash = crypto.createHash('sha256').update(SNAPSHOT_POLICY.format);
+  const entries = [...snapshotEntries(absRepo)].sort((a, b) =>
+    a.relative < b.relative ? -1 : a.relative > b.relative ? 1 : 0);
+  for (const { relative, directory } of entries) {
+    const name = relative.split(path.sep).join('/');
+    const full = path.join(absRepo, relative);
+    if (directory) {
+      hash.update(JSON.stringify(['directory', name]));
+    } else {
+      const bytes = fs.readFileSync(full);
+      hash.update(JSON.stringify(['file', name, fs.statSync(full).mode & 0o111, bytes.length]));
+      hash.update(bytes);
     }
-  };
-
-  walk(absRepo);
-  filePaths.sort();
-  for (const rel of filePaths) {
-    hash.update(rel);
-    hash.update('\0');
-    hash.update(fs.readFileSync(path.join(absRepo, rel)));
-    hash.update('\0');
   }
   return hash.digest('hex');
 }
 
 export function copyRepoSnapshot(absRepo: string, destDir: string): void {
+  const entries = [...snapshotEntries(absRepo)];
   fs.mkdirSync(destDir, { recursive: true });
-  const copyWalk = (srcDir: string, dstDir: string) => {
-    for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
-      if (SKIP_DIRS.has(entry.name)) continue;
-      const srcPath = path.join(srcDir, entry.name);
-      const dstPath = path.join(dstDir, entry.name);
-      if (entry.isDirectory()) {
-        fs.mkdirSync(dstPath, { recursive: true });
-        copyWalk(srcPath, dstPath);
-      } else if (entry.isFile()) {
-        fs.copyFileSync(srcPath, dstPath);
-      }
+  for (const { relative, directory } of entries) {
+    const destination = path.join(destDir, relative);
+    if (directory) {
+      fs.mkdirSync(destination, { recursive: true });
+    } else {
+      const source = path.join(absRepo, relative);
+      fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
+      fs.chmodSync(destination, fs.statSync(source).mode & 0o777);
     }
-  };
-  copyWalk(absRepo, destDir);
+  }
 }
 
 export function detectRepoOnDisk(repoInputPath: string): DetectedRepoInfo {

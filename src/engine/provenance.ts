@@ -15,14 +15,16 @@ export interface RunManifest {
   repoPath: string;
   repoName: string;
   changeId: string;
-  baseCommit: string;
+  baseCommit: string | null;
   isolationMode?: IsolationMode;
   snapshotHash?: string;
+  snapshotPolicy?: object;
+  isolationNote?: string;
   gitRoot?: string | null;
   repoSubpath?: string;
   provider: string;
   model: string;
-  sameModelEnforced: true;
+  sameModelEnforced: boolean;
   detectedLanguage: string;
   testCommand: string;
   lintCommand: string;
@@ -39,6 +41,7 @@ export interface TelemetryEventRecord {
   model: string;
   stage: SddStage;
   task_id: string;
+  resolved_model?: string;
   prompt_tokens: number;
   completion_tokens: number;
   cached_input_tokens: number;
@@ -51,6 +54,7 @@ export interface TelemetryEventRecord {
   duration_ms: number;
   cost_usd: number | null;
   cache_usage_measured: boolean;
+  provider_usage?: object;
   provenance: DataProvenance;
 }
 
@@ -86,6 +90,9 @@ export interface PipelineSideSummary {
   reviewIterations: number;
   testsPassed: boolean;
   testsOutputSummary: string;
+  testExitCode?: number;
+  lintExitCode?: number;
+  acceptanceExitCode?: number | null;
   lintPassed: boolean;
   lintOutputSummary: string;
   reqCoveragePct: number;
@@ -118,6 +125,7 @@ export interface AbRunReport {
   baselineDiff: string;
   optimizedDiff: string;
   metricsJsonl: string;
+  usageComplete?: boolean;
 }
 
 export type LlmProviderId = 'gemini' | 'ollama' | 'openai_compat';

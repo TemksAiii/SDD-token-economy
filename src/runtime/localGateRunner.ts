@@ -75,13 +75,8 @@ export async function runLocalPreReviewGate(
     signal: options.signal,
   });
 
-  const lintErrors =
-    lintRes.exitCode === 0
-      ? []
-      : lintRes.combined
-          .split(/\r?\n/)
-          .filter((l) => l.trim().length > 0)
-          .slice(0, 12);
+  const lintErrors = lintRes.exitCode === 0 ? [] :
+    [lintRes.combined || `Typecheck/lint failed (exit ${lintRes.exitCode})`];
 
   const gate = runPreReviewGate({
     bundle,

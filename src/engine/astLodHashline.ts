@@ -1,3 +1,4 @@
+import { parse, type ParserPlugin } from '@babel/parser';
 import { estimateTokens, shortLineHash } from './tokens';
 
 export type SupportedLanguage = 'typescript' | 'python' | 'go' | 'java';
@@ -136,15 +137,120 @@ export function applyHashlinePatch(
 }
 
 /**
- * Multi-language AST-LOD1 skeleton extractor (signatures, types, exports, docstrings, @spec tags).
+ * Fold executable bodies while keeping module declarations, class members and
+ * source anchors. Other stacks use a line-based outline.
  */
+function extractTypeScriptSkeleton(
+  content: string,
+  filePath: string,
+  lines: string[],
+  heading: string
+): string {
+  const plugins: ParserPlugin[] = [];
+  if (!/\.[cm]?jsx?$/.test(filePath)) plugins.push('typescript');
+  if (/\.[jt]sx$/.test(filePath)) plugins.push('jsx');
+
+  try {
+    const ast = parse(content, { sourceType: 'unambiguous', plugins });
+    const foldedBodies: Array<{ start: number; end: number; text: string }> = [];
+    const fold = (node: { type: string; start?: number | null; end?: number | null } | null | undefined) => {
+      if (node?.start == null || node.end == null) return;
+      foldedBodies.push({
+        start: node.start,
+        end: node.end,
+        text: node.type === 'BlockStatement' || node.type === 'StaticBlock'
+          ? '{ /* ... */ }'
+          : '/* ... */',
+      });
+    };
+
+    for (const statement of ast.program.body) {
+      const declaration = statement.type === 'ExportNamedDeclaration' ||
+        statement.type === 'ExportDefaultDeclaration' ? statement.declaration : statement;
+      if (!declaration) continue;
+      switch (declaration.type) {
+        case 'FunctionDeclaration':
+          fold(declaration.body);
+          break;
+        case 'ClassDeclaration':
+        case 'ClassExpression':
+          for (const member of declaration.body.body) {
+            if (member.type === 'ClassMethod' || member.type === 'ClassPrivateMethod') {
+              fold(member.body);
+            } else if (member.type === 'StaticBlock') {
+              fold(member);
+            } else if (
+              (member.type === 'ClassProperty' || member.type === 'ClassPrivateProperty') &&
+              (member.value?.type === 'ArrowFunctionExpression' || member.value?.type === 'FunctionExpression')
+            ) {
+              fold(member.value.body);
+            }
+          }
+          break;
+        case 'VariableDeclaration':
+          for (const { init } of declaration.declarations) {
+            if (init?.type === 'ArrowFunctionExpression' || init?.type === 'FunctionExpression') {
+              fold(init.body);
+            }
+          }
+          break;
+        case 'ArrowFunctionExpression':
+        case 'FunctionExpression':
+          fold(declaration.body);
+          break;
+      }
+    }
+
+    if (foldedBodies.length === 0) return formatWithHashlines(content).formatted;
+    const lineOffsets = [0];
+    for (const match of content.matchAll(/\n/g)) lineOffsets.push(match.index + 1);
+    const visible = new Map<number, string>();
+    const appendSource = (start: number, end: number) => {
+      let line = lineOffsets.findIndex((offset, i) => offset <= start &&
+        (lineOffsets[i + 1] ?? Infinity) > start);
+      while (start < end) {
+        const next = Math.min(end, lineOffsets[line + 1] ?? end);
+        const segment = content.slice(start, next).replace(/\r?\n$/, '');
+        visible.set(line, (visible.get(line) ?? '') + segment);
+        start = next;
+        line++;
+      }
+    };
+    let cursor = 0;
+    for (const body of foldedBodies) {
+      appendSource(cursor, body.start);
+      const bodyLine = lineOffsets.findIndex((offset, i) => offset <= body.start &&
+        (lineOffsets[i + 1] ?? Infinity) > body.start);
+      visible.set(bodyLine, (visible.get(bodyLine) ?? '') + body.text);
+      cursor = body.end;
+    }
+    appendSource(cursor, content.length);
+    for (const comment of ast.comments ?? []) {
+      if (comment.value.includes('@spec:') && comment.loc &&
+        !visible.has(comment.loc.start.line - 1)) {
+        for (let line = comment.loc.start.line - 1; line < comment.loc.end.line; line++) {
+          visible.set(line, lines[line]);
+        }
+      }
+    }
+    return [heading, ...Array.from(visible.entries())
+      .sort(([a], [b]) => a - b)
+      .filter(([, line]) => line.trim())
+      .map(([line, rendered]) => `L${line + 1}#${shortLineHash(lines[line])}: ${rendered}`)]
+      .join('\n');
+  } catch {
+    return formatWithHashlines(content).formatted;
+  }
+}
+
 export function extractAstSkeleton(
   content: string,
   language: SupportedLanguage,
   filePath = 'module'
 ): string {
   const lines = content.split(/\r?\n/);
-  const out: string[] = [`# AST-LOD1 Skeleton: ${filePath} (${language})`];
+  const heading = `# LOD1 ${language === 'typescript' ? 'AST skeleton' : 'outline'}: ${filePath} (${language})`;
+  const out: string[] = [heading];
 
   if (language === 'python') {
     for (let i = 0; i < lines.length; i++) {
@@ -174,7 +280,7 @@ export function extractAstSkeleton(
         }
       }
     }
-    return out.join('\n');
+    return out.length > 1 ? out.join('\n') : formatWithHashlines(content).formatted;
   }
 
   if (language === 'go') {
@@ -193,7 +299,7 @@ export function extractAstSkeleton(
         );
       }
     }
-    return out.join('\n');
+    return out.length > 1 ? out.join('\n') : formatWithHashlines(content).formatted;
   }
 
   if (language === 'java') {
@@ -212,146 +318,13 @@ export function extractAstSkeleton(
         out.push(`L${i + 1}#${hash}: ${line.replace(/\{\s*$/, '{ ... }')}`);
       }
     }
-    return out.join('\n');
+    return out.length > 1 ? out.join('\n') : formatWithHashlines(content).formatted;
   }
 
-  // TypeScript / JavaScript
-  const countBracesOutsideStrings = (src: string): number => {
-    const stripped = src
-      .replace(/\/\/.*$/, '')
-      .replace(/'(?:\\.|[^'\\])*'/g, "''")
-      .replace(/"(?:\\.|[^"\\])*"/g, '""')
-      .replace(/`(?:\\.|[^`\\])*`/g, '``');
-    return (stripped.match(/\{/g)?.length ?? 0) - (stripped.match(/\}/g)?.length ?? 0);
-  };
-  const methodStartRe =
-    /^(?:public\s+|private\s+|protected\s+|readonly\s+|static\s+|async\s+|override\s+|get\s+|set\s+)*(?:constructor|[A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>=]+>)?\s*\(/;
-
-  let inInterfaceOrTypeBlock = false;
-  let blockBraceDepth = 0;
-  let classDepth = 0;
-  let inMultiLineSig = false;
-  let sigParenDepth = 0;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trim();
-
-    if (inMultiLineSig) {
-      const hash = shortLineHash(line);
-      sigParenDepth += (trimmed.match(/\(/g)?.length ?? 0) - (trimmed.match(/\)/g)?.length ?? 0);
-      const endsSig = sigParenDepth <= 0 && (trimmed.endsWith('{') || trimmed.endsWith('{}') || trimmed.endsWith(';'));
-      const renderedLine =
-        endsSig && trimmed.endsWith('{') && !trimmed.endsWith('{}')
-          ? `${line} /* ... */ }`
-          : line;
-      out.push(`L${i + 1}#${hash}: ${renderedLine}`);
-      if (classDepth > 0) {
-        classDepth = Math.max(0, classDepth + countBracesOutsideStrings(line));
-      }
-      if (endsSig) {
-        inMultiLineSig = false;
-        sigParenDepth = 0;
-      }
-      continue;
-    }
-
-    const isClassHeader =
-      trimmed.startsWith('export class ') ||
-      trimmed.startsWith('export abstract class ') ||
-      trimmed.startsWith('class ') ||
-      trimmed.startsWith('abstract class ');
-
-    const isInterfaceOrTypeHeader =
-      trimmed.startsWith('export interface ') ||
-      trimmed.startsWith('interface ') ||
-      (trimmed.startsWith('export type ') && trimmed.includes('{'));
-
-    const isTopLevelDecl =
-      trimmed.startsWith('import ') ||
-      trimmed.startsWith('export interface ') ||
-      trimmed.startsWith('export type ') ||
-      trimmed.startsWith('export enum ') ||
-      isClassHeader ||
-      trimmed.startsWith('export async function ') ||
-      trimmed.startsWith('export function ') ||
-      trimmed.startsWith('export const ') ||
-      trimmed.startsWith('interface ') ||
-      trimmed.includes('@spec:');
-
-    if (isInterfaceOrTypeHeader) {
-      const hash = shortLineHash(line);
-      out.push(`L${i + 1}#${hash}: ${line}`);
-      inInterfaceOrTypeBlock = true;
-      blockBraceDepth = countBracesOutsideStrings(line);
-      if (blockBraceDepth <= 0) {
-        inInterfaceOrTypeBlock = false;
-      }
-      continue;
-    } else if (inInterfaceOrTypeBlock) {
-      blockBraceDepth += countBracesOutsideStrings(line);
-      if (trimmed && !trimmed.startsWith('//')) {
-        const hash = shortLineHash(line);
-        out.push(`L${i + 1}#${hash}: ${line}`);
-      }
-      if (blockBraceDepth <= 0) {
-        inInterfaceOrTypeBlock = false;
-      }
-      continue;
-    }
-
-    if (isClassHeader) {
-      const hash = shortLineHash(line);
-      out.push(`L${i + 1}#${hash}: ${line}`);
-      classDepth += countBracesOutsideStrings(line);
-      continue;
-    }
-
-    const isTopLevelMethodSig =
-      classDepth === 1 &&
-      methodStartRe.test(trimmed) &&
-      !/^(?:if|for|while|switch|catch|return|throw|new)\b/.test(trimmed);
-
-    const isStandaloneSig =
-      !isTopLevelDecl &&
-      classDepth === 0 &&
-      /^(?:public\s+|private\s+|protected\s+|readonly\s+|static\s+|async\s+)*(?:constructor|[A-Za-z0-9_]+)\s*(?:<[^>{]+>)?\s*\([^;]*\)\s*(?::\s*[^\{;]+)?\s*\{?$/.test(
-        trimmed
-      ) &&
-      !/^(?:if|for|while|switch|catch|return|throw|new)\b/.test(trimmed);
-
-    if (isTopLevelMethodSig) {
-      const hash = shortLineHash(line);
-      const pDelta = (trimmed.match(/\(/g)?.length ?? 0) - (trimmed.match(/\)/g)?.length ?? 0);
-      if (pDelta > 0 || (!trimmed.endsWith('{') && !trimmed.endsWith('{}') && !trimmed.endsWith(';'))) {
-        inMultiLineSig = true;
-        sigParenDepth = pDelta;
-        out.push(`L${i + 1}#${hash}: ${line}`);
-      } else {
-        const folded =
-          trimmed.endsWith('{') && !trimmed.endsWith('{}') ? `${line} /* ... */ }` : line;
-        out.push(`L${i + 1}#${hash}: ${folded}`);
-      }
-      classDepth = Math.max(0, classDepth + countBracesOutsideStrings(line));
-      continue;
-    }
-
-    if (classDepth > 0) {
-      classDepth = Math.max(0, classDepth + countBracesOutsideStrings(line));
-      if (trimmed.includes('@spec:')) {
-        const hash = shortLineHash(line);
-        out.push(`L${i + 1}#${hash}: ${line}`);
-      }
-      continue;
-    }
-
-    if (isTopLevelDecl || isStandaloneSig) {
-      const hash = shortLineHash(line);
-      const folded = trimmed.endsWith('{') ? `${line} /* ... */ }` : line;
-      out.push(`L${i + 1}#${hash}: ${folded}`);
-    }
+  if (language === 'typescript') {
+    return extractTypeScriptSkeleton(content, filePath, lines, heading);
   }
-  return out.join('\n');
+  return formatWithHashlines(content).formatted;
 }
 
 export function renderAstLodView(

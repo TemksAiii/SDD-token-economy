@@ -7,6 +7,7 @@ export interface LlmCallRequest {
   systemInstruction: string;
   prompt: string;
   signal?: AbortSignal;
+  onRetry?: (error: unknown, attempt: number) => void;
 }
 
 export interface LlmUsageSnapshot {
@@ -26,6 +27,7 @@ export interface LlmCallResponse {
   model: string;
   durationMs: number;
   usage: LlmUsageSnapshot;
+  rawUsage: object;
 }
 
 const DEFAULT_OLLAMA_BASE_URL = 'http://127.0.0.1:11434';
@@ -189,7 +191,7 @@ function assembleProviderStatus(ollamaStatus: OllamaDiscoveryStatus): ProviderSt
     availableModels.push(
       {
         id: 'gemini-4-hydrogen',
-        label: 'gemini-4-hydrogen (Gemini Flash · облачный флагман)',
+        label: 'gemini-4-hydrogen (проверяется при запросе)',
         provider: 'gemini',
         tier: 'large',
         locality: 'cloud',
@@ -244,7 +246,7 @@ function assembleProviderStatus(ollamaStatus: OllamaDiscoveryStatus): ProviderSt
       : 'Ни облачный GEMINI_API_KEY, ни локальная Ollama сейчас не активны. Задайте GEMINI_API_KEY (для Gemini Hydrogen) или запустите локально `ollama serve` + `ollama pull qwen2.5-coder:7b` без API-ключа. Детерминированные модули (Slicer, AST-LOD, Gate) и симуляция работают сразу.';
   } else if (geminiConfigured && ollamaConfigured) {
     limitationNote =
-      'Доступны облачный флагман Gemini Hydrogen (GEMINI_API_KEY) и локальная Ollama без API-ключа. Для одного A/B-эксперимента всегда используется строго один провайдер и одна модель.';
+      'Настроен GEMINI_API_KEY и доступна локальная Ollama. Доступность модели Gemini проверяется при запросе. Для одного A/B-эксперимента всегда используется строго один провайдер и одна модель.';
   } else if (defaultProvider === 'ollama') {
     limitationNote = `Готова локальная Ollama (${ollamaStatus.baseUrl}, без API-ключа). Примечание: для Ollama денежная стоимость равна n/a, а API-кэш токенов не отдаётся сервером (cacheUsageMeasured: false).`;
   } else {
@@ -301,6 +303,7 @@ function getGeminiClient(): GoogleGenAI {
     cachedGeminiClient = new GoogleGenAI({
       apiKey,
       httpOptions: {
+        retryOptions: { attempts: 1 },
         headers: {
           'User-Agent': 'aistudio-build',
         },
@@ -332,6 +335,7 @@ export async function callLlmWithUsage(req: LlmCallRequest): Promise<LlmCallResp
           model: req.model,
           contents: req.prompt,
           config: {
+            abortSignal: req.signal,
             systemInstruction: req.systemInstruction,
             responseMimeType: 'application/json',
             thinkingConfig: {
@@ -359,7 +363,8 @@ export async function callLlmWithUsage(req: LlmCallRequest): Promise<LlmCallResp
         return {
           text: (response.text ?? '').trim(),
           provider: 'gemini',
-          model: req.model,
+          model: response.modelVersion ?? req.model,
+          rawUsage: um,
           durationMs: Date.now() - started,
           usage: {
             promptTokens,
@@ -384,6 +389,7 @@ export async function callLlmWithUsage(req: LlmCallRequest): Promise<LlmCallResp
         if (!retryable || attempt === maxAttempts) {
           throw err;
         }
+        req.onRetry?.(err, attempt);
         await new Promise((r) => setTimeout(r, 800 * attempt));
       }
     }
@@ -439,6 +445,7 @@ export async function callLlmWithUsage(req: LlmCallRequest): Promise<LlmCallResp
     }
 
     const json = (await resp.json()) as {
+      model?: string;
       message?: { content?: string };
       prompt_eval_count?: number;
       eval_count?: number;
@@ -461,7 +468,8 @@ export async function callLlmWithUsage(req: LlmCallRequest): Promise<LlmCallResp
     return {
       text: (json.message?.content ?? '').trim(),
       provider: 'ollama',
-      model: req.model,
+      model: json.model ?? req.model,
+      rawUsage: { prompt_eval_count: promptTokens, eval_count: completionTokens },
       durationMs: Date.now() - started,
       usage: {
         promptTokens,
@@ -506,6 +514,7 @@ export async function callLlmWithUsage(req: LlmCallRequest): Promise<LlmCallResp
   }
 
   const json = (await resp.json()) as {
+    model?: string;
     choices?: Array<{ message?: { content?: string } }>;
     usage?: {
       prompt_tokens?: number;
@@ -531,7 +540,8 @@ export async function callLlmWithUsage(req: LlmCallRequest): Promise<LlmCallResp
   return {
     text: (json.choices?.[0]?.message?.content ?? '').trim(),
     provider: 'openai_compat',
-    model: req.model,
+    model: json.model ?? req.model,
+    rawUsage: u,
     durationMs: Date.now() - started,
     usage: {
       promptTokens,

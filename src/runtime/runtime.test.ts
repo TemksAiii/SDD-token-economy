@@ -185,41 +185,29 @@ export class IdempotencyGuard {
 const STEP4_WEBHOOK_TS = `import crypto from 'node:crypto';
 
 // @spec:REQ-04
-export function signWebhookPayload(secret: string, payload: string, timestampSec: number): string {
-  const signed = \`\${timestampSec}.\${payload}\`;
-  return crypto.createHmac('sha256', secret).update(signed).digest('hex');
+export function signWebhookPayload(secret: string, timestampSec: number, body: string): string {
+  const signature = crypto.createHmac('sha256', secret).update(\`\${timestampSec}.\${body}\`).digest('hex');
+  return \`t=\${timestampSec},v1=\${signature}\`;
 }
 `;
 
-const FINAL_WEBHOOK_TS = `import crypto from 'node:crypto';
-
-// @spec:REQ-04
-export function signWebhookPayload(secret: string, payload: string, timestampSec: number): string {
-  const signed = \`\${timestampSec}.\${payload}\`;
-  return crypto.createHmac('sha256', secret).update(signed).digest('hex');
-}
+const FINAL_WEBHOOK_TS = `${STEP4_WEBHOOK_TS}
 
 // @spec:REQ-05
 export function verifyWebhookSignature(
-  secret: string,
-  payload: string,
-  timestampSec: number,
-  signatureHex: string,
-  nowSec = Math.floor(Date.now() / 1000),
-  toleranceSec = 300
+  secret: string, header: string, body: string, nowSec: number, maxAgeSec: number
 ): boolean {
-  if (Math.abs(nowSec - timestampSec) > toleranceSec) return false;
-  const expected = signWebhookPayload(secret, payload, timestampSec);
-  const expectedBuf = Buffer.from(expected, 'utf8');
-  const actualBuf = Buffer.from(signatureHex, 'utf8');
-  if (expectedBuf.length !== actualBuf.length) return false;
-  return crypto.timingSafeEqual(expectedBuf, actualBuf);
+  const match = /^t=(\\d+),v1=([a-f0-9]{64})$/.exec(header);
+  if (!match) return false;
+  const timestamp = Number(match[1]);
+  if (!Number.isSafeInteger(timestamp) || Math.abs(nowSec - timestamp) > maxAgeSec) return false;
+  const expected = signWebhookPayload(secret, timestamp, body).split(',v1=')[1];
+  return crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(match[2], 'hex'));
 }
 
 // @spec:REQ-06
-export function computeRetryDelayMs(attempt: number, baseMs = 250, maxMs = 10_000): number {
-  const exp = baseMs * Math.pow(2, Math.max(0, attempt - 1));
-  return Math.min(maxMs, exp);
+export function computeRetryDelayMs(attempt: number, baseMs = 1000, maxMs = 60_000): number {
+  return Math.min(maxMs, baseMs * 2 ** (attempt - 1));
 }
 `;
 
@@ -265,11 +253,11 @@ import {
 
 // @spec:REQ-04 @spec:REQ-05 @spec:REQ-06
 test('webhook signing, timing-safe verification, and backoff delay work per spec', () => {
-  const sig = signWebhookPayload('sec', '{"id":1}', 1000);
-  assert.equal(sig.length, 64);
-  assert.equal(verifyWebhookSignature('sec', '{"id":1}', 1000, sig, 1100, 300), true);
-  assert.equal(verifyWebhookSignature('sec', '{"id":1}', 1000, sig.replace(/^./, sig[0] === 'a' ? 'b' : 'a'), 1100, 300), false);
-  assert.equal(verifyWebhookSignature('sec', '{"id":1}', 1000, sig, 2000, 300), false);
+  const sig = signWebhookPayload('sec', 1000, '{"id":1}');
+  assert.match(sig, /^t=1000,v1=[a-f0-9]{64}$/);
+  assert.equal(verifyWebhookSignature('sec', sig, '{"id":1}', 1100, 300), true);
+  assert.equal(verifyWebhookSignature('sec', sig, '{"id":2}', 1100, 300), false);
+  assert.equal(verifyWebhookSignature('sec', sig, '{"id":1}', 2000, 300), false);
   assert.equal(computeRetryDelayMs(1, 200, 1000), 200);
   assert.equal(computeRetryDelayMs(3, 200, 1000), 800);
   assert.equal(computeRetryDelayMs(6, 200, 1000), 1000);
@@ -484,7 +472,16 @@ test('runRealAbWorktreeBenchmark supports nested git repos (git_worktree) and no
     assert.equal(nestedReport.optimized.testsPassed, true);
     assert.equal(nestedReport.optimized.lintPassed, true);
     assert.equal(nestedReport.optimized.reqCoveragePct, 100);
+    assert.equal(nestedReport.baseline.acceptanceExitCode, 0);
+    assert.equal(nestedReport.optimized.acceptanceExitCode, 0);
     assert.equal(nestedReport.qualityParityPassed, true);
+    const events = nestedReport.metricsJsonl.split('\n').map(line => JSON.parse(line));
+    assert.ok(events.every(row => row.provider_usage && row.tool_calls === 0));
+    assert.equal(events.reduce((sum, row) => sum + row.total_tokens, 0),
+      nestedReport.baseline.totalTokens + nestedReport.optimized.totalTokens);
+    const checks = fs.readFileSync(path.join(RUNS_ROOT, nestedReport.manifest.runId, 'checks.jsonl'), 'utf8');
+    assert.match(checks, /"side":"baseline","step":"verify"/);
+    assert.match(checks, /"side":"spectrim","step":"verify"/);
     assert.ok((nestedReport.savings.totalTokensPct ?? 0) > 30);
     assert.ok((nestedReport.savings.completionTokensPct ?? 0) > 0);
     assert.match(nestedReport.optimizedDiff, /src\/idempotency\/idempotencyGuard\.ts/);
@@ -500,7 +497,7 @@ test('runRealAbWorktreeBenchmark supports nested git repos (git_worktree) and no
     createdRunIds.push(snapReport.manifest.runId);
 
     assert.equal(snapReport.manifest.isolationMode, 'snapshot_copy');
-    assert.match(snapReport.manifest.baseCommit, /^snapshot:[0-9a-f]{12}$/);
+    assert.equal(snapReport.manifest.baseCommit, null);
     assert.ok(snapReport.manifest.snapshotHash && snapReport.manifest.snapshotHash.length === 64);
     assert.ok(snapReport.limitations.some((l) => l.includes('snapshot_copy')));
     assert.equal(snapReport.optimized.testsPassed, true);

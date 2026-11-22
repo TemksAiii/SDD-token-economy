@@ -24,12 +24,10 @@ export function generateJuryDeliverables(report: AbRunReport): JuryDeliverablesB
       : 'git worktree';
   const provBadge =
     provenance === 'measured'
-      ? manifest.provider === 'ollama'
-        ? `MEASURED (Локальный инференс Ollama + ${isoLabel} + реальные тесты, без API-ключа)`
-        : `MEASURED (Реальные замеры API провайдера + ${isoLabel} + тесты)`
+      ? `MEASURED · Счётчики облачного API и ${isoLabel}`
       : provenance === 'measured_local'
-      ? 'MEASURED_LOCAL (Локальные замеры токенизации и реальные тесты без LLM API)'
-      : 'SIMULATED / DEMO FIXTURE (Локальная симуляция — НЕ является измеренным доказательством)';
+        ? `MEASURED_LOCAL · Локальные счётчики или проверки и ${isoLabel}`
+        : 'SIMULATED / DEMO FIXTURE · Демонстрационные данные';
 
   const stageRows = baseline.stages
     .map((bs, idx) => {
@@ -47,16 +45,17 @@ export function generateJuryDeliverables(report: AbRunReport): JuryDeliverablesB
       ? `- **Isolation Mode / Snapshot SHA-256:** \`snapshot_copy\` · \`${manifest.snapshotHash ?? manifest.baseCommit}\` (не Git commit)`
       : `- **Isolation Mode / Base Commit:** \`git_worktree\` · \`${manifest.baseCommit}\`${manifest.repoSubpath ? ` (subpath: \`${manifest.repoSubpath}\`)` : ''}`;
 
+  const exit = (code: number | null | undefined) => code ?? '—';
   const reportMd = `# SpecTrim — Отчёт A/B-эксперимента SDD
 
 > **Достоверность данных (Provenance):** \`${provBadge}\`
 ${limitations.length > 0 ? `\n**Ограничения замера:**\n${limitations.map((l) => `- ${l}`).join('\n')}\n` : ''}
-## 1. Идентичность условий (Run Manifest)
+## 1. Условия запуска (Run Manifest)
 
 - **Run ID:** \`${manifest.runId}\`
 - **Репозиторий / Change ID:** \`${manifest.repoName}\` / \`${manifest.changeId}\`
 ${baseRefLine}
-- **Провайдер и модель (идентичны для A и B):** \`${manifest.provider}\` / \`${manifest.model}\`
+- **Запрошенные провайдер и модель для A и B:** \`${manifest.provider}\` / \`${manifest.model}\`
 - **Язык и команды проверки:** \`${manifest.detectedLanguage}\` · \`${manifest.testCommand}\` · \`${manifest.lintCommand}\`
 
 ## 2. Сводка Before / After
@@ -67,10 +66,10 @@ ${baseRefLine}
 | **Prompt / Input токены** | ${baseline.promptTokens.toLocaleString('ru-RU')} | ${optimized.promptTokens.toLocaleString('ru-RU')} | **${formatSavingsPct(savings.promptTokensPct)}** | \`${provenance}\` |
 | **Cached Input токены** | ${baseline.cachedInputTokens.toLocaleString('ru-RU')} | ${optimized.cachedInputTokens.toLocaleString('ru-RU')} | cache measured: \`${optimized.cacheUsageMeasured}\` | \`${provenance}\` |
 | **Completion / Output токены** | ${baseline.completionTokens.toLocaleString('ru-RU')} | ${optimized.completionTokens.toLocaleString('ru-RU')} | **${formatSavingsPct(savings.completionTokensPct)}** | \`${provenance}\` |
-| **Расчётная стоимость ($)** | ${baseline.costUsd !== null ? `$${baseline.costUsd.toFixed(4)}` : 'n/a'} | ${optimized.costUsd !== null ? `$${optimized.costUsd.toFixed(4)}` : 'n/a'} | **${formatSavingsPct(savings.costPct)}** | \`${provenance}\` |
-| **Tool calls / Retries** | ${baseline.toolCalls} / ${baseline.retries} | ${optimized.toolCalls} / ${optimized.retries} | retries: ${savings.retriesDelta >= 0 ? `−${savings.retriesDelta}` : `+${Math.abs(savings.retriesDelta)}`} | \`${provenance}\` |
+| **Расчётная стоимость ($)** | ${baseline.costUsd !== null ? `$${baseline.costUsd.toFixed(4)}` : 'n/a'} | ${optimized.costUsd !== null ? `$${optimized.costUsd.toFixed(4)}` : 'n/a'} | **${formatSavingsPct(savings.costPct)}** | \`estimated\` |
+| **Вызовы инструментов модели / повторы** | ${baseline.toolCalls} / ${baseline.retries} | ${optimized.toolCalls} / ${optimized.retries} | retries: ${savings.retriesDelta >= 0 ? `−${savings.retriesDelta}` : `+${Math.abs(savings.retriesDelta)}`} | \`${provenance}\` |
 | **Итерации LLM-ревью** | ${baseline.reviewIterations} | ${optimized.reviewIterations} | **${savings.reviewIterationsDelta >= 0 ? `−${savings.reviewIterationsDelta}` : `+${Math.abs(savings.reviewIterationsDelta)}`}** | \`${provenance}\` |
-| **Время выполнения** | ${(baseline.durationMs / 1000).toFixed(2)} с | ${(optimized.durationMs / 1000).toFixed(2)} с | ${savings.durationDeltaMs >= 0 ? `−${(savings.durationDeltaMs / 1000).toFixed(2)} с` : `+${(Math.abs(savings.durationDeltaMs) / 1000).toFixed(2)} с`} | \`${provenance}\` |
+| **Сумма длительностей запросов к модели** | ${(baseline.durationMs / 1000).toFixed(2)} с | ${(optimized.durationMs / 1000).toFixed(2)} с | ${savings.durationDeltaMs >= 0 ? `−${(savings.durationDeltaMs / 1000).toFixed(2)} с` : `+${(Math.abs(savings.durationDeltaMs) / 1000).toFixed(2)} с`} | \`${provenance}\` |
 
 ## 3. Токены по стадиям SDD
 
@@ -81,11 +80,12 @@ ${stageRows}
 ## 4. Автоматическая проверка качества (Acceptance Criteria)
 
 - **Задачи выполнена/всего:** Baseline \`${baseline.tasksCompleted}/${baseline.tasksTotal}\` · SpecTrim \`${optimized.tasksCompleted}/${optimized.tasksTotal}\`
-- **Покрытие требований спеки (\`@spec:REQ-XX\`):** Baseline **${baseline.reqCoveragePct}%** · SpecTrim **${optimized.reqCoveragePct}%**
+- **Трассировка требований по маркерам (\`@spec:REQ-XX\`):** Baseline **${baseline.reqCoveragePct}%** · SpecTrim **${optimized.reqCoveragePct}%**
 - **Тесты:** Baseline \`${baseline.testsPassed ? 'PASS' : 'FAIL'}\` (${baseline.testsOutputSummary}) · SpecTrim \`${optimized.testsPassed ? 'PASS' : 'FAIL'}\` (${optimized.testsOutputSummary})
 - **Типизация и линтер:** Baseline \`${baseline.lintPassed ? 'PASS' : 'FAIL'}\` · SpecTrim \`${optimized.lintPassed ? 'PASS' : 'FAIL'}\`
 - **Согласованность \`specs ↔ design ↔ tasks\`:** Baseline \`${baseline.artifactConsistency}\` · SpecTrim \`${optimized.artifactConsistency}\`
-- **Quality Parity (100% REQ + Tests + Lint + Consistency):** \`${report.qualityParityPassed ? 'PASS' : 'FAIL'}\`
+- **Коды выхода тестов, типизации и независимых тестов:** Baseline ${exit(baseline.testExitCode)} / ${exit(baseline.lintExitCode)} / ${exit(baseline.acceptanceExitCode)} · SpecTrim ${exit(optimized.testExitCode)} / ${exit(optimized.lintExitCode)} / ${exit(optimized.acceptanceExitCode)}
+- **Quality Parity:** \`${report.qualityParityPassed ? 'PASS' : 'FAIL'}\`
 `;
 
   const reproducibilityMd = `# Воспроизводимость и запуск SpecTrim CLI / A/B Benchmark
@@ -127,28 +127,30 @@ npm run spectrim -- bench benchmarks/orders-ts add-idempotency-and-webhooks --pr
 
 ## 3. Артефакты воспроизводимого запуска
 Каждый прогон сохраняется в \`.spectrim-runs/<runId>/\`:
-- \`run_manifest.json\` — commit SHA, провайдер, модель, команды тестов/линтера, пути worktree
-- \`metrics.jsonl\` — построчная телеметрия каждого шага с \`provenance\` (\`measured\` / \`measured_local\`)
-- \`baseline.diff\` и \`optimized.diff\` — реальные \`git diff\` из изолированных worktree
+- \`run_manifest.json\` — Git SHA или SHA-256 проверенного снимка, провайдер, модель и команды проверок
+- \`metrics.jsonl\` — телеметрия ответов с исходными счётчиками провайдера и \`provenance\` (\`measured\` / \`measured_local\`)
+- \`baseline.diff\` и \`optimized.diff\` — diff обеих изолированных копий
+- \`checks.jsonl\` — команды проверок, полный stdout/stderr и коды выхода обеих сторон
+- \`provider-attempts.jsonl\` — попытки вызова провайдера, включая сбои
 - \`summary.json\` и \`REPORT.md\` — сводные таблицы и проверка acceptance criteria
 `;
 
   const demoScriptMd = `# Сценарий видео-демонстрации (3:30)
 
-1. **0:00–0:35 · Реальный репозиторий и постановка**: показать \`benchmarks/orders-ts/openspec/changes/add-idempotency-and-webhooks/\` и \`run_manifest.json\` (один commit, одна модель и провайдер для A и B).
-2. **0:35–1:30 · Живой прогон A/B в двух git worktree**: запуск \`spectrim bench\` или кнопки в UI, просмотр реальных событий в \`metrics.jsonl\` с \`provenance: measured\`, сравнение \`baseline.diff\` и \`optimized.diff\`.
-3. **1:30–2:30 · Разбор 5 механизмов в действии**: Spec Slicer + State Capsule, AST-LOD1, Hashline-патч (и отказ на устаревшем хэше), сжатие TAP/pytest/git diff, Zero-Token Pre-Review Gate с реальным запуском \`tsx --test\` и \`tsc --noEmit\`.
+1. **0:00–0:35 · Реальный репозиторий и постановка**: показать \`benchmarks/orders-ts/openspec/changes/add-idempotency-and-webhooks/\` и \`run_manifest.json\` (Git SHA или SHA-256 снимка, общие модель и провайдер для A и B).
+2. **0:35–1:30 · Изолированный прогон A/B**: запуск \`spectrim bench\` или кнопки в UI, просмотр реальных событий в \`metrics.jsonl\` с \`provenance: measured\`, сравнение \`baseline.diff\` и \`optimized.diff\`.
+3. **1:30–2:30 · Разбор 5 механизмов в действии**: Spec Slicer + State Capsule, AST-LOD1, Hashline-патч (и отказ на устаревшем хэше), сжатие TAP/pytest/git diff, Zero-Token Pre-Review Gate с реальным запуском \`node --import tsx --test\` и \`tsc --noEmit\`.
 4. **2:30–3:10 · Портативность**: \`spectrim detect\` на TypeScript (\`package.json\`), Python (\`pyproject.toml\` + \`unittest\`), Go (\`go.mod\`) и Java (\`pom.xml\`).
-5. **3:10–3:30 · Итог**: таблица Before/After из \`REPORT.md\`, 100% покрытие REQ и 100% зелёные тесты.
+5. **3:10–3:30 · Итог**: таблица Before/After из \`REPORT.md\`, фактические результаты тестов и Quality Parity обеих сторон.
 `;
 
   const pitchSlidesMd = `# Презентация SpecTrim (7 слайдов)
 
 1. **Проблема**: $O(N^2)$ рост контекста, повторное чтение спеки/кода и слепые циклы ревью в \`OpenCode + OpenSpec\`.
-2. **Ограничения**: без model routing, без урезания требований, 100% REQ и зелёные тесты.
+2. **Ограничения**: общие модель и постановка, исходные требования и независимые проверки.
 3. **Архитектура**: Spec Slicer + State Capsule, AST-LOD + Hashline, Diff/Log Compressor, Zero-Token Pre-Review Gate, Delta Review + KV-Cache порядок.
-4. **Доказательная база A/B**: два изолированных \`git worktree\` от одного \`baseCommit\`, реальный \`usageMetadata\` провайдера в \`metrics.jsonl\`, строгая маркировка \`measured\` vs \`simulated\`.
-5. **Универсальность**: микро-сессии и Hashline убирают Context Rot и ошибки патчей на малых и больших LLM.
+4. **Доказательная база A/B**: общий Git SHA или SHA-256 снимка, исходная телеметрия, коды выхода, независимые проверки.
+5. **Проверка качества**: фактические тесты и типизация у каждой стороны, трассировка и независимая проверка требований.
 6. **Портативность**: автодетект TS/JS, Python, Go, Java по манифестам без правки ядра.
 7. **Артефакты**: \`REPORT.md\`, \`run_manifest.json\`, \`.opencode/plugins/spectrim.ts\`.
 `;

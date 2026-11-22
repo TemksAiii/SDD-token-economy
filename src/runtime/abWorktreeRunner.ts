@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   AbRunReport,
   IsolationMode,
@@ -31,13 +32,12 @@ import { generateJuryDeliverables } from '../engine/juryDeliverables';
 import { resolveConfinedPath, RUNS_ROOT, sanitizeIdSegment } from './pathGuard';
 import {
   collectRepoFiles,
-  computeRepoSnapshotHash,
-  copyRepoSnapshot,
+  SNAPSHOT_POLICY,
   detectRepoOnDisk,
-  inspectGitContext,
   readOpenSpecBundleFromDisk,
   writeRepoFileConfined,
 } from './repoFs';
+import { prepareBenchmarkIsolation } from './benchmarkIsolation';
 import { runSafeCommand, splitCommandArgs } from './execUtils';
 import { callLlmWithUsage, getProviderStatusAsync } from './llmProvider';
 
@@ -68,7 +68,6 @@ interface StageAccumulator {
   thoughtsTokens: number;
   totalTokens: number;
   durationMs: number;
-  toolCalls: number;
   retries: number;
   costUsd: number;
   hasKnownCost: boolean;
@@ -84,7 +83,6 @@ function emptyAcc(): StageAccumulator {
     thoughtsTokens: 0,
     totalTokens: 0,
     durationMs: 0,
-    toolCalls: 0,
     retries: 0,
     costUsd: 0,
     hasKnownCost: false,
@@ -241,13 +239,17 @@ async function computeIsolatedDiffAndStatus(
   signal?: AbortSignal
 ): Promise<{ diff: string; changedFiles: string[] }> {
   if (isolationMode === 'git_worktree') {
-    await runSafeCommand('git', ['add', '-N', '--', '.'], repoDir, { signal });
+    const staged = await runSafeCommand('git', ['add', '-N', '--', '.'], repoDir, { signal });
+    if (staged.exitCode !== 0) throw new Error(`git add -N failed: ${staged.combined}`);
     const diffRes = await runSafeCommand('git', ['diff', '--relative', '--no-color', '--', '.'], repoDir, {
       signal,
     });
     const statusRes = await runSafeCommand('git', ['status', '--short', '--', '.'], repoDir, {
       signal,
     });
+    if (diffRes.exitCode !== 0 || statusRes.exitCode !== 0) {
+      throw new Error(`Cannot read worktree diff/status: ${diffRes.combined} ${statusRes.combined}`);
+    }
     return {
       diff: diffRes.stdout,
       changedFiles: statusRes.stdout
@@ -272,6 +274,7 @@ async function computeIsolatedDiffAndStatus(
     runDir,
     { signal }
   );
+  if (statusRes.exitCode > 1) throw new Error(`Cannot read snapshot status: ${statusRes.combined}`);
   const changedFiles = statusRes.stdout
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -302,7 +305,8 @@ interface AgentPatchPayload {
 
 function applyAgentEdits(
   repoDir: string,
-  parsed: AgentPatchPayload | null
+  parsed: AgentPatchPayload | null,
+  allowedPaths?: ReadonlySet<string>
 ): { appliedCount: number; patchErrors: string[] } {
   const patchErrors: string[] = [];
   let appliedCount = 0;
@@ -313,7 +317,11 @@ function applyAgentEdits(
 
   if (Array.isArray(parsed.hashline_patches)) {
     for (const p of parsed.hashline_patches) {
-      if (!p?.path) continue;
+      if (typeof p?.path !== 'string') continue;
+      if (allowedPaths && !allowedPaths.has(p.path)) {
+        patchErrors.push(`Unexpected file: ${p.path}`);
+        continue;
+      }
       const absF = resolveConfinedPath(path.join(repoDir, p.path), repoDir);
       if (!fs.existsSync(absF)) {
         patchErrors.push(`Target file ${p.path} does not exist for hashline_patch`);
@@ -332,7 +340,15 @@ function applyAgentEdits(
 
   if (Array.isArray(parsed.files)) {
     for (const f of parsed.files) {
-      if (f?.path && typeof f.content === 'string') {
+      if (typeof f?.path === 'string' && typeof f.content === 'string') {
+        if (allowedPaths && !allowedPaths.has(f.path)) {
+          patchErrors.push(`Unexpected file: ${f.path}`);
+          continue;
+        }
+        if (fs.existsSync(resolveConfinedPath(path.join(repoDir, f.path), repoDir))) {
+          patchErrors.push(`Use a hashline patch for existing file ${f.path}`);
+          continue;
+        }
         writeRepoFileConfined(repoDir, f.path, f.content);
         appliedCount++;
       }
@@ -458,41 +474,24 @@ export async function runRealAbWorktreeBenchmark(
 
   const absRepo = resolveConfinedPath(opts.repoPath);
   const repoInfo = detectRepoOnDisk(opts.repoPath);
-  const gitCtx = inspectGitContext(absRepo);
-  const snapshotHash = computeRepoSnapshotHash(absRepo);
-
-  const isolationMode: IsolationMode =
-    gitCtx.isGitRepo && gitCtx.absGitRoot && gitCtx.headCommit
-      ? 'git_worktree'
-      : 'snapshot_copy';
-  const baseCommit =
-    isolationMode === 'git_worktree' && gitCtx.headCommit
-      ? gitCtx.headCommit
-      : `snapshot:${snapshotHash.slice(0, 12)}`;
-
-  const bundle = readOpenSpecBundleFromDisk(opts.repoPath, opts.changeId);
-  const graph = parseOpenSpecBundle(bundle);
-  if (graph.tasks.length === 0) {
-    throw new Error(`В change ${opts.changeId} не найдены задачи в tasks.md`);
-  }
-
   const runId = `run-${new Date().toISOString().replace(/[:.]/g, '-')}-${Math.random()
     .toString(36)
     .slice(2, 6)}`;
   const runDir = path.join(RUNS_ROOT, runId);
-  const baselineWtRoot = path.join(runDir, 'worktree-baseline');
-  const optimizedWtRoot = path.join(runDir, 'worktree-optimized');
-  const snapshotBaseDir = path.join(runDir, 'snapshot-base');
   fs.mkdirSync(runDir, { recursive: true });
-
-  const baselineRepoDir =
-    isolationMode === 'git_worktree' && gitCtx.repoSubpath
-      ? path.join(baselineWtRoot, gitCtx.repoSubpath)
-      : baselineWtRoot;
-  const optimizedRepoDir =
-    isolationMode === 'git_worktree' && gitCtx.repoSubpath
-      ? path.join(optimizedWtRoot, gitCtx.repoSubpath)
-      : optimizedWtRoot;
+  const manifestPath = path.join(runDir, 'run_manifest.json');
+  const isolation = await prepareBenchmarkIsolation(absRepo, runDir, opts.signal).catch(error => {
+    fs.writeFileSync(manifestPath, JSON.stringify({
+      runId, createdAt: new Date().toISOString(), repoPath: repoInfo.repoPath,
+      repoName: repoInfo.repoName, changeId: opts.changeId,
+      provider: selectedProvider, model, baseCommit: null, sameModelEnforced: false,
+      status: opts.signal?.aborted ? 'cancelled' : 'failed',
+      error: error instanceof Error ? error.message : String(error),
+    }, null, 2));
+    throw error;
+  });
+  const { mode: isolationMode, baselineDir: baselineRepoDir, optimizedDir: optimizedRepoDir,
+    baseCommit, snapshotHash, git: gitCtx } = isolation;
 
   const emit = (
     phase: BenchmarkProgressEvent['phase'],
@@ -515,15 +514,17 @@ export async function runRealAbWorktreeBenchmark(
     createdAt: new Date().toISOString(),
     repoPath: repoInfo.repoPath,
     repoName: repoInfo.repoName,
-    changeId: bundle.changeId,
+    changeId: opts.changeId,
     baseCommit,
     isolationMode,
     snapshotHash,
+    snapshotPolicy: snapshotHash ? SNAPSHOT_POLICY : undefined,
+    isolationNote: isolation.reason,
     gitRoot: gitCtx.gitRoot,
     repoSubpath: gitCtx.repoSubpath,
     provider: selectedProvider,
     model,
-    sameModelEnforced: true,
+    sameModelEnforced: false,
     detectedLanguage: repoInfo.language,
     testCommand: repoInfo.testCommand,
     lintCommand: repoInfo.lintCommand,
@@ -532,9 +533,35 @@ export async function runRealAbWorktreeBenchmark(
     status: 'running',
   };
 
-  fs.writeFileSync(path.join(runDir, 'run_manifest.json'), JSON.stringify(manifest, null, 2));
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
 
   const telemetry: TelemetryEventRecord[] = [];
+  const metricsPath = path.join(runDir, 'metrics.jsonl');
+  const attemptsPath = path.join(runDir, 'provider-attempts.jsonl');
+  let usageComplete = true;
+  const appendJson = (file: string, value: object) =>
+    fs.appendFileSync(file, JSON.stringify(value) + '\n');
+  const finalChecksPath = path.join(runDir, 'checks.jsonl');
+  const runChecks = async (side: 'baseline' | 'spectrim', step: string, repoDir: string) => {
+    const result = await execRepoChecks(repoDir, repoInfo.testCommand, repoInfo.lintCommand, opts.signal);
+    appendJson(finalChecksPath, { side, step, ...result });
+    return result;
+  };
+
+  const acceptancePath = fileURLToPath(new URL('./acceptance/orders-idempotency.test.mts', import.meta.url));
+  const runAcceptance = async (side: 'baseline' | 'spectrim', step: string, repoDir: string) => {
+    if (opts.changeId !== 'add-idempotency-and-webhooks' || repoInfo.language !== 'typescript') {
+      return null;
+    }
+    const args = ['--import', 'tsx', '--test', '--test-reporter=tap', acceptancePath];
+    const result = await runSafeCommand(process.execPath, args, repoDir, { signal: opts.signal });
+    appendJson(finalChecksPath, { side, step, command: [process.execPath, ...args], acceptance: result });
+    return result;
+  };
+  const lintFailures = (check: Awaited<ReturnType<typeof execRepoChecks>>['lintRes']) =>
+    check.exitCode === 0 ? [] : [check.combined || `Typecheck/lint failed (exit ${check.exitCode})`];
+  const provenance = selectedProvider === 'ollama' ? 'measured_local' : 'measured';
+
 
   const recordUsage = (
     run: 'baseline' | 'spectrim',
@@ -542,7 +569,6 @@ export async function runRealAbWorktreeBenchmark(
     taskId: string,
     acc: StageAccumulator,
     resp: Awaited<ReturnType<typeof callLlmWithUsage>>,
-    toolCalls: number,
     retries: number,
     reviewIter: number
   ) => {
@@ -553,7 +579,6 @@ export async function runRealAbWorktreeBenchmark(
     acc.thoughtsTokens += resp.usage.thoughtsTokens;
     acc.totalTokens += resp.usage.totalTokens;
     acc.durationMs += resp.durationMs;
-    acc.toolCalls += toolCalls;
     acc.retries += retries;
     if (resp.usage.costUsd !== null) {
       acc.hasKnownCost = true;
@@ -563,11 +588,12 @@ export async function runRealAbWorktreeBenchmark(
       acc.cacheUsageMeasured = true;
     }
 
-    telemetry.push({
+    const row: TelemetryEventRecord = {
       ts: new Date().toISOString(),
       run,
       provider: selectedProvider,
       model,
+      resolved_model: resp.model,
       stage,
       task_id: taskId,
       prompt_tokens: resp.usage.promptTokens,
@@ -576,50 +602,65 @@ export async function runRealAbWorktreeBenchmark(
       uncached_input_tokens: resp.usage.uncachedInputTokens,
       thoughts_tokens: resp.usage.thoughtsTokens,
       total_tokens: resp.usage.totalTokens,
-      tool_calls: toolCalls,
+      tool_calls: 0,
       retries,
       review_iteration: reviewIter,
       duration_ms: resp.durationMs,
       cost_usd: resp.usage.costUsd,
       cache_usage_measured: resp.usage.cacheUsageMeasured,
-      provenance: 'measured',
-    });
+      provenance,
+      provider_usage: resp.rawUsage,
+    };
+    telemetry.push(row);
+    appendJson(metricsPath, row);
+  };
+  const measure = async (
+    side: 'baseline' | 'spectrim', stage: SddStage, taskId: string, acc: StageAccumulator,
+    request: Parameters<typeof callLlmWithUsage>[0], retries = 0, reviewIter = 0
+  ) => {
+    const attemptLog = (error: unknown, attempt: number) => {
+      usageComplete = false;
+      appendJson(attemptsPath, { side, stage, taskId, attempt, status: 'failed', usage: null,
+        error: error instanceof Error ? error.name : 'ProviderError' });
+    };
+    let failures = 0;
+    try {
+      const response = await callLlmWithUsage({ ...request, onRetry: (error, attempt) => {
+        failures++;
+        attemptLog(error, attempt);
+      } });
+      appendJson(attemptsPath, { side, stage, taskId, attempt: failures + 1, status: 'ok' });
+      recordUsage(side, stage, taskId, acc, response, retries + failures, reviewIter);
+      return response;
+    } catch (error) {
+      attemptLog(error, failures + 1);
+      throw error;
+    }
   };
 
   try {
-    if (isolationMode === 'git_worktree' && gitCtx.absGitRoot && gitCtx.headCommit) {
-      const subNote = gitCtx.repoSubpath ? ` (подкаталог ${gitCtx.repoSubpath})` : '';
-      emit(
-        'setup',
-        `Создание изолированных git worktree от commit ${gitCtx.headCommit.slice(0, 7)}${subNote}...`
-      );
-      const wt1 = await runSafeCommand(
-        'git',
-        ['worktree', 'add', '--detach', baselineWtRoot, gitCtx.headCommit],
-        gitCtx.absGitRoot,
-        { signal: opts.signal }
-      );
-      if (wt1.exitCode !== 0) {
-        throw new Error(`git worktree add baseline failed: ${wt1.combined}`);
+    const bundle = readOpenSpecBundleFromDisk(baselineRepoDir, opts.changeId);
+    const graph = parseOpenSpecBundle(bundle);
+    const benchmarkTargets = opts.changeId === 'add-idempotency-and-webhooks' && repoInfo.language === 'typescript'
+      ? new Set(graph.tasks.flatMap(task => task.targetFiles))
+      : undefined;
+    const applyBaselineEdits = (edits: unknown) => {
+      if (!Array.isArray(edits)) return false;
+      let applied = false;
+      for (const edit of edits) {
+        if (typeof edit?.path !== 'string' || typeof edit.content !== 'string' ||
+          (benchmarkTargets && !benchmarkTargets.has(edit.path))) continue;
+        writeRepoFileConfined(baselineRepoDir, edit.path, edit.content);
+        applied = true;
       }
-      const wt2 = await runSafeCommand(
-        'git',
-        ['worktree', 'add', '--detach', optimizedWtRoot, gitCtx.headCommit],
-        gitCtx.absGitRoot,
-        { signal: opts.signal }
-      );
-      if (wt2.exitCode !== 0) {
-        throw new Error(`git worktree add optimized failed: ${wt2.combined}`);
-      }
-    } else {
-      emit(
-        'setup',
-        `Git-репозиторий не обнаружен; создание двух идентичных snapshot-копий (SHA-256: ${snapshotHash.slice(0, 12)})...`
-      );
-      copyRepoSnapshot(absRepo, snapshotBaseDir);
-      copyRepoSnapshot(snapshotBaseDir, baselineWtRoot);
-      copyRepoSnapshot(snapshotBaseDir, optimizedWtRoot);
+      return applied;
+    };
+    if (graph.tasks.length === 0) {
+      throw new Error(`В change ${opts.changeId} не найдены задачи в tasks.md`);
     }
+    emit('setup', isolationMode === 'git_worktree'
+      ? `Два Git worktree от ${baseCommit} (${gitCtx.repoSubpath || '.'}).`
+      : `Две проверенные копии снимка SHA-256 ${snapshotHash}. ${isolation.reason}`);
 
     const totalSteps = graph.tasks.length * 2 + 6;
     let currentStep = 0;
@@ -651,7 +692,7 @@ export async function runRealAbWorktreeBenchmark(
       ++currentStep,
       totalSteps
     );
-    const basePrepResp = await callLlmWithUsage({
+    const basePrepResp = await measure('baseline', 'spec_prep', 'SPEC-ALL', baseAcc.spec_prep, {
       provider: selectedProvider,
       model,
       systemInstruction:
@@ -659,7 +700,6 @@ export async function runRealAbWorktreeBenchmark(
       prompt: `Review the full OpenSpec artifacts and existing repository files, and output JSON {"plan": ["..."], "risks": ["..."]}.\n\n${fullSpecDump}\n\n${baseFilesSnapshot}`,
       signal: opts.signal,
     });
-    recordUsage('baseline', 'spec_prep', 'SPEC-ALL', baseAcc.spec_prep, basePrepResp, 4, 0, 0);
 
     let accumulatedHistory = `Plan: ${basePrepResp.text}\n`;
     const pendingTasks = graph.tasks.filter((t) => !t.completed);
@@ -684,7 +724,7 @@ ${currentFiles}
 [SESSION HISTORY SO FAR]
 ${accumulatedHistory}`;
 
-      const resp = await callLlmWithUsage({
+      const resp = await measure('baseline', 'apply', task.id, baseAcc.apply, {
         provider: selectedProvider,
         model,
         systemInstruction:
@@ -694,30 +734,15 @@ ${accumulatedHistory}`;
       });
 
       const parsed = parseJsonSafe<{ edits?: Array<{ path: string; content: string }> }>(resp.text);
-      let retries = 0;
-      if (parsed?.edits) {
-        for (const edit of parsed.edits) {
-          if (edit.path && typeof edit.content === 'string') {
-            writeRepoFileConfined(baselineRepoDir, edit.path, edit.content);
-          }
-        }
-      } else {
-        retries = 1;
-      }
+      applyBaselineEdits(parsed?.edits);
 
-      const checks = await execRepoChecks(
-        baselineRepoDir,
-        repoInfo.testCommand,
-        repoInfo.lintCommand,
-        opts.signal
-      );
+      const checks = await runChecks('baseline', task.id, baselineRepoDir);
       if (taskArtifactsSatisfied(baselineRepoDir, task)) {
         markTaskDoneInFile(baselineRepoDir, bundle.changeId, task.id, true);
       }
 
       const rawToolOutput = `TEST EXIT ${checks.testRes.exitCode}:\n${checks.testRes.combined}\nLINT EXIT ${checks.lintRes.exitCode}:\n${checks.lintRes.combined}`;
       accumulatedHistory += `\n--- Step ${task.id} ---\nAssistant edits: ${resp.text.slice(0, 1800)}\nTool output:\n${rawToolOutput}\n`;
-      recordUsage('baseline', 'apply', task.id, baseAcc.apply, resp, 5, retries, 0);
     }
 
     // Baseline review iterations (full diff + raw logs)
@@ -735,57 +760,39 @@ ${accumulatedHistory}`;
       const untrackedFiles = collectRepoFiles(baselineRepoDir)
         .map((f) => `--- ${f.path} ---\n${f.content}`)
         .join('\n\n');
-      const checks = await execRepoChecks(
-        baselineRepoDir,
-        repoInfo.testCommand,
-        repoInfo.lintCommand,
-        opts.signal
-      );
+      const checks = await runChecks('baseline', `review-${iter}`, baselineRepoDir);
+      const acceptance = await runAcceptance('baseline', `review-${iter}`, baselineRepoDir);
       const testAnalysis = analyzeTestRunOutput(checks.testRes.combined, checks.testRes.exitCode);
 
-      const revResp = await callLlmWithUsage({
+      const revResp = await measure('baseline', 'review', `REV-${iter}`, baseAcc.review, {
         provider: selectedProvider,
         model,
         systemInstruction:
           'You are a strict code reviewer. Return JSON {"approved": boolean, "issues": ["..."], "edits": [{"path":"...","content":"..."}]}.',
-        prompt: `Review iteration ${iter}. Check all requirements, tests, and typecheck.\n\n[FULL SPEC]\n${fullSpecDump}\n\n[GIT DIFF]\n${rawDiffText}\n\n[FULL FILES]\n${untrackedFiles}\n\n[RAW TEST/LINT]\n${checks.testRes.combined}\n${checks.lintRes.combined}`,
+        prompt: `Review iteration ${iter}. Check all requirements, tests, and typecheck.\n\n[FULL SPEC]\n${fullSpecDump}\n\n[GIT DIFF]\n${rawDiffText}\n\n[FULL FILES]\n${untrackedFiles}\n\n[RAW TEST/LINT]\n${checks.testRes.combined}\n${checks.lintRes.combined}\n[INDEPENDENT ACCEPTANCE]\n${acceptance?.combined ?? 'unavailable'}`,
         signal: opts.signal,
-      });
+      }, 0, iter);
 
       const parsedRev = parseJsonSafe<{
         approved?: boolean;
         edits?: Array<{ path: string; content: string }>;
       }>(revResp.text);
 
-      const revRetries = parsedRev ? 0 : 1;
-      let editsApplied = false;
-      if (parsedRev?.edits && parsedRev.edits.length > 0) {
-        for (const edit of parsedRev.edits) {
-          if (edit.path && typeof edit.content === 'string') {
-            writeRepoFileConfined(baselineRepoDir, edit.path, edit.content);
-            editsApplied = true;
-          }
-        }
-      }
-      recordUsage('baseline', 'review', `REV-${iter}`, baseAcc.review, revResp, 4, revRetries, iter);
+      const editsApplied = applyBaselineEdits(parsedRev?.edits);
 
-      if (parsedRev?.approved && !editsApplied && testAnalysis.passed && checks.lintRes.exitCode === 0) {
+      if (parsedRev?.approved && !editsApplied && testAnalysis.passed && checks.lintRes.exitCode === 0 && (acceptance?.exitCode ?? 0) === 0) {
         break;
       }
     }
 
     // Baseline final verification
-    const baseFinalChecks = await execRepoChecks(
-      baselineRepoDir,
-      repoInfo.testCommand,
-      repoInfo.lintCommand,
-      opts.signal
-    );
+    const baseFinalChecks = await runChecks('baseline', 'verify', baselineRepoDir);
+    const baseAcceptance = await runAcceptance('baseline', 'verify', baselineRepoDir);
     const baseFinalTestAnalysis = analyzeTestRunOutput(
       baseFinalChecks.testRes.combined,
       baseFinalChecks.testRes.exitCode
     );
-    const baseVerifyResp = await callLlmWithUsage({
+    await measure('baseline', 'verify', 'VERIFY-ALL', baseAcc.verify, {
       provider: selectedProvider,
       model,
       systemInstruction:
@@ -793,7 +800,6 @@ ${accumulatedHistory}`;
       prompt: `Verify all requirements and tests.\n${fullSpecDump}\nTest exit: ${baseFinalChecks.testRes.exitCode}\n${baseFinalChecks.testRes.combined}`,
       signal: opts.signal,
     });
-    recordUsage('baseline', 'verify', 'VERIFY-ALL', baseAcc.verify, baseVerifyResp, 3, 0, 0);
 
     // =========================================================================
     // RUN B: SPECTRIM OPTIMIZED (Task-sliced micro-sessions, AST-LOD, Hashline, Compressor, Gate, Delta)
@@ -805,25 +811,13 @@ ${accumulatedHistory}`;
       verify: emptyAcc(),
     };
 
-    emit(
-      'spectrim',
-      '[SpecTrim] spec_prep: парсинг графа REQ→DES→TSK + 1 компактная синхронизация...',
-      ++currentStep,
-      totalSteps
-    );
-    const optPrepResp = await callLlmWithUsage({
-      provider: selectedProvider,
-      model,
-      systemInstruction:
-        'You are a SpecTrim SDD planner. Return concise JSON {"glossary": ["..."], "contracts": ["..."]}.',
-      prompt: `Proposal:\n${bundle.proposalMd}\nTask IDs: ${graph.tasks.map((t) => `${t.id}(${t.linkedReqs.join(',')})`).join(', ')}`,
-      signal: opts.signal,
-    });
-    recordUsage('spectrim', 'spec_prep', 'SPEC-GRAPH', optAcc.spec_prep, optPrepResp, 1, 0, 0);
+    emit('spectrim', '[SpecTrim] spec_prep: локальный граф REQ → DES → TSK, 0 LLM-запросов.',
+      ++currentStep, totalSteps);
 
     const completedContracts: Array<{ taskId: string; file: string; symbol: string; reqs: string[] }> = [];
     const completedIds: string[] = graph.tasks.filter((t) => t.completed).map((t) => t.id);
 
+    let previousCheckFailures = '';
     const staticSystemPrompt =
       'You are a SpecTrim micro-session coding agent. For existing files shown in LOD0 (L{n}#{hash}: ...), ALWAYS output compact "hashline_patches" ranges instead of rewriting full files. Only use "files" when creating a brand-new file not yet on disk. Return strict JSON {"hashline_patches":[{"path":"...","startLine":1,"startHash":"abc","endLine":1,"endHash":"abc","replacement":"..."}], "files":[{"path":"...","content":"..."}], "exported_symbol":"..."}.';
 
@@ -886,11 +880,12 @@ ${accumulatedHistory}`;
         `[TARGET_FILES_LOD0]\n${targetBlocks.join('\n\n')}`,
         neighborLod1Blocks.length > 0 ? `[NEIGHBOR_INTERFACES_LOD1]\n${neighborLod1Blocks.join('\n\n')}` : '',
         lod2Section,
+        previousCheckFailures && `[PREVIOUS CHECK FAILURES]\n${previousCheckFailures}`,
       ]
         .filter(Boolean)
         .join('\n\n');
 
-      const resp = await callLlmWithUsage({
+      const resp = await measure('spectrim', 'apply', task.id, optAcc.apply, {
         provider: selectedProvider,
         model,
         systemInstruction: staticSystemPrompt,
@@ -899,11 +894,9 @@ ${accumulatedHistory}`;
       });
 
       const parsed = parseJsonSafe<AgentPatchPayload>(resp.text);
-      let retries = 0;
-      const editOutcome = applyAgentEdits(optimizedRepoDir, parsed);
+      const editOutcome = applyAgentEdits(optimizedRepoDir, parsed, benchmarkTargets);
 
       if (!parsed || editOutcome.patchErrors.length > 0) {
-        retries += 1;
         // Single targeted micro-retry refreshing only the failed file's LOD0
         const refreshedFiles = collectRepoFiles(optimizedRepoDir);
         const refreshedTargets = task.targetFiles
@@ -912,16 +905,15 @@ ${accumulatedHistory}`;
           .map((rf) => `### REFRESHED LOD0 ${rf.path}\n${renderAstLodView(rf.path, rf.content, repoInfo.language, 'LOD0').rendered}`);
 
         const retryPrompt = `${slice.compiledPromptBundle}\n\n[PATCH_REPAIR]\nErrors: ${editOutcome.patchErrors.join('; ')}\n${refreshedTargets.join('\n\n')}`;
-        const retryResp = await callLlmWithUsage({
+        const retryResp = await measure('spectrim', 'apply', `${task.id}-RETRY`, optAcc.apply, {
           provider: selectedProvider,
           model,
           systemInstruction: staticSystemPrompt,
           prompt: retryPrompt,
           signal: opts.signal,
-        });
+        }, 1);
         const retryParsed = parseJsonSafe<AgentPatchPayload>(retryResp.text);
-        applyAgentEdits(optimizedRepoDir, retryParsed);
-        recordUsage('spectrim', 'apply', `${task.id}-RETRY`, optAcc.apply, retryResp, 1, 1, 0);
+        applyAgentEdits(optimizedRepoDir, retryParsed, benchmarkTargets);
         if (retryParsed?.exported_symbol) {
           completedContracts.push({
             taskId: task.id,
@@ -939,16 +931,12 @@ ${accumulatedHistory}`;
         });
       }
 
-      const checks = await execRepoChecks(
-        optimizedRepoDir,
-        repoInfo.testCommand,
-        repoInfo.lintCommand,
-        opts.signal
-      );
-      const _compressedLog = compressTestLog(checks.testRes.combined, repoInfo.testRunnerKind, {
-        exitCode: checks.testRes.exitCode,
-      });
-
+      const checks = await runChecks('spectrim', task.id, optimizedRepoDir);
+      previousCheckFailures = [
+        checks.testRes.exitCode === 0 ? '' : compressTestLog(checks.testRes.combined, repoInfo.testRunnerKind,
+          { exitCode: checks.testRes.exitCode }).compressed,
+        checks.lintRes.exitCode === 0 ? '' : lintFailures(checks.lintRes).join('\n').slice(0, 1600),
+      ].filter(Boolean).join('\n');
       if (taskArtifactsSatisfied(optimizedRepoDir, task)) {
         markTaskDoneInFile(optimizedRepoDir, bundle.changeId, task.id, true);
         if (!completedIds.includes(task.id)) completedIds.push(task.id);
@@ -960,18 +948,13 @@ ${accumulatedHistory}`;
         JSON.stringify(slice.stateCapsule, null, 2)
       );
 
-      recordUsage('spectrim', 'apply', task.id, optAcc.apply, resp, 3, retries, 0);
     }
 
     // Zero-Token Pre-Review Gate + up to 2 Gate-guided repair micro-sessions
     const runGateCheck = async () => {
-      const gateChecks = await execRepoChecks(
-        optimizedRepoDir,
-        repoInfo.testCommand,
-        repoInfo.lintCommand,
-        opts.signal
-      );
+      const gateChecks = await runChecks('spectrim', 'gate', optimizedRepoDir);
       const testAnalysis = analyzeTestRunOutput(gateChecks.testRes.combined, gateChecks.testRes.exitCode);
+      const acceptance = await runAcceptance('spectrim', 'gate', optimizedRepoDir);
       const curBundle = readOpenSpecBundleFromDisk(optimizedRepoDir, bundle.changeId);
       const curGraph = parseOpenSpecBundle(curBundle);
       const synced = syncCompletedTasksInFile(optimizedRepoDir, bundle.changeId, curGraph.tasks);
@@ -983,22 +966,18 @@ ${accumulatedHistory}`;
       const gate = runPreReviewGate({
         bundle: updatedBundle,
         files: optFiles,
-        testsPassing: testAnalysis.passed,
-        failingTestSnippet: testAnalysis.passed
+        testsPassing: testAnalysis.passed && (acceptance?.exitCode ?? 0) === 0,
+        failingTestSnippet: acceptance && acceptance.exitCode !== 0
+          ? compressTestLog(acceptance.combined, 'node_test', { exitCode: acceptance.exitCode }).compressed
+          : testAnalysis.passed
           ? undefined
           : compressTestLog(gateChecks.testRes.combined, repoInfo.testRunnerKind, {
               exitCode: gateChecks.testRes.exitCode,
             }).compressed,
-        lintErrors:
-          gateChecks.lintRes.exitCode === 0
-            ? []
-            : gateChecks.lintRes.combined
-                .split(/\r?\n/)
-                .filter((l) => l.trim().length > 0)
-                .slice(0, 12),
+        lintErrors: lintFailures(gateChecks.lintRes),
         verifySubstance: true,
       });
-      return { gate, gateChecks, optFiles, updatedBundle };
+      return { gate, gateChecks, optFiles };
     };
 
     emit('spectrim', '[SpecTrim] Zero-Token Pre-Review Gate (0 LLM токенов)...', ++currentStep, totalSteps);
@@ -1011,91 +990,84 @@ ${accumulatedHistory}`;
         currentStep,
         totalSteps
       );
-      const fixFilesLod0 = gateState.optFiles
-        .filter((f) => {
-          const isRelevantTest = f.isTest && f.path.includes('idempotency');
-          const hasErr =
-            gateState.gateChecks.lintRes.combined.includes(f.path) ||
-            gateState.gateChecks.testRes.combined.includes(f.path);
-          return isRelevantTest || hasErr || !f.isTest;
-        })
-        .slice(0, 5)
-        .map((f) => `### LOD0 ${f.path}\n${renderAstLodView(f.path, f.content, repoInfo.language, 'LOD0').rendered}`);
+      const existingFiles = new Map(gateState.optFiles.map(file => [file.path, file]));
+      const repairPaths = new Set(graph.tasks.flatMap(task => task.targetFiles));
+      for (const file of gateState.optFiles) {
+        if (gateState.gateChecks.lintRes.combined.includes(file.path) ||
+            gateState.gateChecks.testRes.combined.includes(file.path)) {
+          repairPaths.add(file.path);
+        }
+      }
+      const fixFilesLod0 = [...repairPaths].map(file => {
+        const existing = existingFiles.get(file);
+        return existing
+          ? `### LOD0 ${file}\n${renderAstLodView(file, existing.content, repoInfo.language, 'LOD0').rendered}`
+          : `### NEW TARGET FILE (create via files): ${file}`;
+      });
 
-      const fixPrompt = `${gateState.gate.conciseReport}\n\n[SPECS_SUMMARY]\n${Object.entries(gateState.updatedBundle.specsMd)
+      const fixPrompt = `${gateState.gate.conciseReport}\n\n[SPECS_SUMMARY]\n${Object.entries(bundle.specsMd)
         .map(([k, v]) => `## ${k}\n${v}`)
         .join('\n\n')}\n\n[FILES_LOD0]\n${fixFilesLod0.join('\n\n')}`;
 
-      const fixResp = await callLlmWithUsage({
+      const fixResp = await measure('spectrim', 'apply', `GATE-FIX-${fixAttempt}`, optAcc.apply, {
         provider: selectedProvider,
         model,
         systemInstruction: staticSystemPrompt,
         prompt: fixPrompt,
         signal: opts.signal,
-      });
+      }, Number(fixAttempt > 1));
       const parsedFix = parseJsonSafe<AgentPatchPayload>(fixResp.text);
-      const fixOutcome = applyAgentEdits(optimizedRepoDir, parsedFix);
-      recordUsage(
-        'spectrim',
-        'apply',
-        `GATE-FIX-${fixAttempt}`,
-        optAcc.apply,
-        fixResp,
-        2,
-        fixOutcome.patchErrors.length > 0 ? 1 : 0,
-        0
-      );
+      applyAgentEdits(optimizedRepoDir, parsedFix, benchmarkTargets);
       gateState = await runGateCheck();
     }
 
     let preGate = gateState.gate;
 
-    // Single Incremental Delta Review
-    emit('spectrim', '[SpecTrim] Delta Review (1 проход по сжатому diff)...', ++currentStep, totalSteps);
-    const { diff: optRawDiffText } = await computeIsolatedDiffAndStatus(
-      isolationMode,
-      runDir,
-      optimizedRepoDir,
-      'worktree-optimized',
-      opts.signal
-    );
-    const compressedDiff = compressGitDiff(optRawDiffText);
+    let optimizedReviewIters = 0;
+    if (preGate.passed) {
+      optimizedReviewIters = 1;
+      // Single Incremental Delta Review
+      emit('spectrim', '[SpecTrim] Delta Review (1 проход по сжатому diff)...', ++currentStep, totalSteps);
+      const { diff: optRawDiffText } = await computeIsolatedDiffAndStatus(
+        isolationMode,
+        runDir,
+        optimizedRepoDir,
+        'worktree-optimized',
+        opts.signal
+      );
+      const compressedDiff = compressGitDiff(optRawDiffText);
 
-    const deltaRevResp = await callLlmWithUsage({
-      provider: selectedProvider,
-      model,
-      systemInstruction:
-        'You are a delta code reviewer. Pre-Review Gate already verified deterministic checks. Only propose patches if a real behavioral or @spec bug exists in the delta. Return JSON {"approved": boolean, "notes": ["..."], "hashline_patches": [], "files": []}.',
-      prompt: `Gate report:\n${preGate.conciseReport}\n\n[COMPRESSED DELTA DIFF]\n${compressedDiff.compressed}`,
-      signal: opts.signal,
-    });
-    const parsedDelta = parseJsonSafe<AgentPatchPayload & { approved?: boolean }>(deltaRevResp.text);
-    if (parsedDelta && (parsedDelta.hashline_patches?.length || parsedDelta.files?.length)) {
-      applyAgentEdits(optimizedRepoDir, parsedDelta);
-      gateState = await runGateCheck();
-      preGate = gateState.gate;
+      const deltaRevResp = await measure('spectrim', 'review', 'REV-DELTA-1', optAcc.review, {
+        provider: selectedProvider,
+        model,
+        systemInstruction:
+          'You are a delta code reviewer. Pre-Review Gate already verified deterministic checks. Only propose patches if a real behavioral or @spec bug exists in the delta. Return JSON {"approved": boolean, "notes": ["..."], "hashline_patches": [], "files": []}.',
+        prompt: `Gate report:\n${preGate.conciseReport}\n\n[COMPRESSED DELTA DIFF]\n${compressedDiff.compressed}`,
+        signal: opts.signal,
+      }, 0, 1);
+      const parsedDelta = parseJsonSafe<AgentPatchPayload & { approved?: boolean }>(deltaRevResp.text);
+      if (parsedDelta && (parsedDelta.hashline_patches?.length || parsedDelta.files?.length)) {
+        applyAgentEdits(optimizedRepoDir, parsedDelta, benchmarkTargets);
+        gateState = await runGateCheck();
+        preGate = gateState.gate;
+      }
+
     }
-    recordUsage('spectrim', 'review', 'REV-DELTA-1', optAcc.review, deltaRevResp, 2, 0, 1);
 
     // Final verify (deterministic matrix + 1 tiny semantic confirmation)
-    const optFinalChecks = await execRepoChecks(
-      optimizedRepoDir,
-      repoInfo.testCommand,
-      repoInfo.lintCommand,
-      opts.signal
-    );
+    const optFinalChecks = await runChecks('spectrim', 'verify', optimizedRepoDir);
+    const optAcceptance = await runAcceptance('spectrim', 'verify', optimizedRepoDir);
     const optFinalTestAnalysis = analyzeTestRunOutput(
       optFinalChecks.testRes.combined,
       optFinalChecks.testRes.exitCode
     );
-    const optVerifyResp = await callLlmWithUsage({
+    await measure('spectrim', 'verify', 'VERIFY-GATE', optAcc.verify, {
       provider: selectedProvider,
       model,
       systemInstruction: 'Return JSON {"verified": boolean}.',
       prompt: `Gate passed: ${preGate.passed}. Test exit: ${optFinalChecks.testRes.exitCode}. Tests green: ${optFinalTestAnalysis.passed}. Lint exit: ${optFinalChecks.lintRes.exitCode}.`,
       signal: opts.signal,
     });
-    recordUsage('spectrim', 'verify', 'VERIFY-GATE', optAcc.verify, optVerifyResp, 1, 0, 0);
 
     // Build Final Summaries & Diffs
     emit('verify', 'Сбор acceptance criteria, diff и сохранение артефактов...', ++currentStep, totalSteps);
@@ -1121,6 +1093,7 @@ ${accumulatedHistory}`;
       reviewIters: number,
       checks: Awaited<ReturnType<typeof execRepoChecks>>,
       testAnalysis: ReturnType<typeof analyzeTestRunOutput>,
+      acceptance: Awaited<ReturnType<typeof runAcceptance>>,
       diffOut: string,
       changedFiles: string[]
     ): PipelineSideSummary => {
@@ -1136,9 +1109,9 @@ ${accumulatedHistory}`;
           thoughtsTokens: a.thoughtsTokens,
           totalTokens: a.totalTokens,
           durationMs: a.durationMs,
-          toolCalls: a.toolCalls,
+          toolCalls: 0,
           retries: a.retries,
-          provenance: 'measured',
+          provenance: side === 'spectrim' && stage === 'spec_prep' ? 'measured_local' : provenance,
         };
       });
 
@@ -1156,7 +1129,13 @@ ${accumulatedHistory}`;
         verifySubstance: true,
       });
 
-      const allReqIds = finalGraph.requirements.map((r) => r.id);
+      const stripTaskStatus = (text: string) => text.replace(/(^\s*[-*]\s+)\[[ xX]\]/gm, '$1[ ]');
+      const originalSpec = Object.entries(bundle.specsMd).sort();
+      const specUnchanged = finalBundle.proposalMd === bundle.proposalMd &&
+        finalBundle.designMd === bundle.designMd &&
+        JSON.stringify(Object.entries(finalBundle.specsMd).sort()) === JSON.stringify(originalSpec) &&
+        stripTaskStatus(finalBundle.tasksMd) === stripTaskStatus(bundle.tasksMd);
+      const allReqIds = graph.requirements.map((r) => r.id);
       const uncoveredSet = new Set([
         ...gateEval.uncoveredReqsInCode,
         ...gateEval.uncoveredReqsInTests,
@@ -1165,7 +1144,7 @@ ${accumulatedHistory}`;
       const reqCoveragePct =
         allReqIds.length > 0
           ? Number(((coveredReqs.length / allReqIds.length) * 100).toFixed(1))
-          : 100;
+          : 0;
 
       const sumAcc = (fn: (a: StageAccumulator) => number) =>
         Object.values(accMap).reduce((s, a) => s + fn(a), 0);
@@ -1186,7 +1165,7 @@ ${accumulatedHistory}`;
 
       return {
         side,
-        provenance: 'measured',
+        provenance,
         promptTokens: sumAcc((a) => a.promptTokens),
         completionTokens: sumAcc((a) => a.completionTokens),
         cachedInputTokens: sumAcc((a) => a.cachedInputTokens),
@@ -1196,10 +1175,13 @@ ${accumulatedHistory}`;
         costUsd: hasKnownCost ? Number(sumAcc((a) => a.costUsd).toFixed(6)) : null,
         cacheUsageMeasured: cacheMeasured,
         durationMs: sumAcc((a) => a.durationMs),
-        toolCalls: sumAcc((a) => a.toolCalls),
+        toolCalls: 0,
         retries: sumAcc((a) => a.retries),
         reviewIterations: reviewIters,
         testsPassed: effectiveTestsPassed,
+        testExitCode: checks.testRes.exitCode,
+        lintExitCode: checks.lintRes.exitCode,
+        acceptanceExitCode: acceptance?.exitCode ?? null,
         testsOutputSummary,
         lintPassed: checks.lintRes.exitCode === 0,
         lintOutputSummary:
@@ -1209,9 +1191,9 @@ ${accumulatedHistory}`;
         reqCoveragePct,
         coveredReqs,
         uncoveredReqs: Array.from(uncoveredSet),
-        artifactConsistency: gateEval.consistencyErrors.length === 0,
+        artifactConsistency: specUnchanged && gateEval.consistencyErrors.length === 0,
         tasksCompleted: finalGraph.tasks.filter((t) => t.completed).length,
-        tasksTotal: finalGraph.tasks.length,
+        tasksTotal: graph.tasks.length,
         changedFiles,
         diffLineCount: diffOut ? diffOut.split(/\r?\n/).length : 0,
         stages,
@@ -1225,6 +1207,7 @@ ${accumulatedHistory}`;
       baselineReviewIters,
       baseFinalChecks,
       baseFinalTestAnalysis,
+      baseAcceptance,
       baseArtifacts.diff,
       baseArtifacts.changedFiles
     );
@@ -1232,9 +1215,10 @@ ${accumulatedHistory}`;
       'spectrim',
       optimizedRepoDir,
       optAcc,
-      1,
+      optimizedReviewIters,
       optFinalChecks,
       optFinalTestAnalysis,
+      optAcceptance,
       optArtifacts.diff,
       optArtifacts.changedFiles
     );
@@ -1242,12 +1226,14 @@ ${accumulatedHistory}`;
     const pct = (b: number, o: number) =>
       b > 0 ? Number((((b - o) / b) * 100).toFixed(1)) : null;
 
+    const resolvedModels = new Set(telemetry.map(row => row.resolved_model));
+    manifest.sameModelEnforced = resolvedModels.size === 1;
     manifest.status = 'completed';
 
     const limitations: string[] = [];
     if (isolationMode === 'snapshot_copy') {
       limitations.push(
-        `Окружение не содержит .git / commit HEAD; изоляция A и B выполнена через snapshot_copy двух идентичных копий исходного снимка (SHA-256: ${snapshotHash.slice(0, 12)}), а не через git worktree от общего commit SHA.`
+        `snapshot_copy: две независимо проверенные копии, SHA-256 ${snapshotHash}. ${isolation.reason}`
       );
     } else if (gitCtx.repoSubpath) {
       limitations.push(
@@ -1278,23 +1264,31 @@ ${accumulatedHistory}`;
       }
     }
 
+    const comparableUsage = usageComplete && manifest.sameModelEnforced;
+    if (!manifest.sameModelEnforced) limitations.push('Provider responses identified different model versions.');
+    if (!usageComplete) limitations.push('Some provider attempts returned no usage. Token and cost savings are unavailable.');
     const metricsJsonl = telemetry.map((t) => JSON.stringify(t)).join('\n');
+    const meetsAcceptance = (side: PipelineSideSummary) =>
+      side.testsPassed && side.lintPassed && side.acceptanceExitCode === 0 &&
+      side.reqCoveragePct === 100 && side.artifactConsistency &&
+      side.tasksTotal > 0 && side.tasksCompleted === side.tasksTotal;
 
     const report: AbRunReport = {
       manifest,
-      provenance: 'measured',
+      provenance,
+      usageComplete,
       limitations,
       baseline: baselineSummary,
       optimized: optimizedSummary,
       savings: {
-        totalTokensPct: pct(baselineSummary.totalTokens, optimizedSummary.totalTokens),
-        promptTokensPct: pct(baselineSummary.promptTokens, optimizedSummary.promptTokens),
-        completionTokensPct: pct(
+        totalTokensPct: comparableUsage ? pct(baselineSummary.totalTokens, optimizedSummary.totalTokens) : null,
+        promptTokensPct: comparableUsage ? pct(baselineSummary.promptTokens, optimizedSummary.promptTokens) : null,
+        completionTokensPct: comparableUsage ? pct(
           baselineSummary.completionTokens,
           optimizedSummary.completionTokens
-        ),
+        ) : null,
         costPct:
-          baselineSummary.costUsd !== null && optimizedSummary.costUsd !== null
+          comparableUsage && baselineSummary.costUsd !== null && optimizedSummary.costUsd !== null
             ? pct(baselineSummary.costUsd, optimizedSummary.costUsd)
             : null,
         reviewIterationsDelta:
@@ -1302,20 +1296,14 @@ ${accumulatedHistory}`;
         retriesDelta: baselineSummary.retries - optimizedSummary.retries,
         durationDeltaMs: baselineSummary.durationMs - optimizedSummary.durationMs,
       },
-      qualityParityPassed:
-        optimizedSummary.testsPassed &&
-        optimizedSummary.lintPassed &&
-        optimizedSummary.reqCoveragePct === 100 &&
-        optimizedSummary.reqCoveragePct >= baselineSummary.reqCoveragePct &&
-        optimizedSummary.artifactConsistency,
+      qualityParityPassed: manifest.sameModelEnforced && meetsAcceptance(baselineSummary) && meetsAcceptance(optimizedSummary),
       baselineDiff: baseArtifacts.diff || '# No tracked file changes',
       optimizedDiff: optArtifacts.diff || '# No tracked file changes',
       metricsJsonl,
     };
 
     const deliverables = generateJuryDeliverables(report);
-    fs.writeFileSync(path.join(runDir, 'run_manifest.json'), JSON.stringify(manifest, null, 2));
-    fs.writeFileSync(path.join(runDir, 'metrics.jsonl'), metricsJsonl);
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
     fs.writeFileSync(path.join(runDir, 'baseline.diff'), report.baselineDiff);
     fs.writeFileSync(path.join(runDir, 'optimized.diff'), report.optimizedDiff);
     fs.writeFileSync(path.join(runDir, 'summary.json'), JSON.stringify(report, null, 2));
@@ -1323,28 +1311,17 @@ ${accumulatedHistory}`;
 
     emit(
       'done',
-      `Прогон ${runId} (${selectedProvider} / ${model}) завершён. Экономия: ${report.savings.totalTokensPct ?? 0}% (measured).`
+      `Прогон ${runId} (${selectedProvider} / ${model}) завершён. Экономия: ${report.savings.totalTokensPct === null ? 'n/a' : report.savings.totalTokensPct + '%'} (${provenance}).`
     );
     return report;
   } catch (err) {
     const aborted = opts.signal?.aborted || (err instanceof Error && err.message.includes('aborted'));
     manifest.status = aborted ? 'cancelled' : 'failed';
     manifest.error = err instanceof Error ? err.message : String(err);
-    fs.writeFileSync(path.join(runDir, 'run_manifest.json'), JSON.stringify(manifest, null, 2));
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
     emit(aborted ? 'cancelled' : 'error', manifest.error);
     throw err;
   } finally {
-    if (isolationMode === 'git_worktree' && gitCtx.absGitRoot) {
-      await runSafeCommand('git', ['worktree', 'remove', '--force', baselineWtRoot], gitCtx.absGitRoot).catch(
-        () => undefined
-      );
-      await runSafeCommand('git', ['worktree', 'remove', '--force', optimizedWtRoot], gitCtx.absGitRoot).catch(
-        () => undefined
-      );
-    } else {
-      fs.rmSync(snapshotBaseDir, { recursive: true, force: true });
-      fs.rmSync(baselineWtRoot, { recursive: true, force: true });
-      fs.rmSync(optimizedWtRoot, { recursive: true, force: true });
-    }
+    await isolation.cleanup();
   }
 }

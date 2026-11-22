@@ -106,3 +106,30 @@ export class IdempotencyGuard {
   assert.match(multiSkeleton, /consume\(/);
   assert.ok(!multiSkeleton.includes('this.resolveKey(apiKey)'));
 });
+
+test('TSX AST keeps multiline contracts and re-exports, folding JSX and preserving original anchors', () => {
+  const source = `export {
+  encode as publicEncode,
+} from './codec';
+export const Component = (
+  props: { label: string },
+) => <b>{props.label}</b>;
+export default function render() {
+  const ignored = /https?:\\/\\//;
+  return <Component label="test" />;
+}`;
+  const skeleton = extractAstSkeleton(source, 'typescript', 'component.tsx');
+  assert.match(skeleton, /encode as publicEncode/);
+  assert.match(skeleton, /props: \{ label: string \}/);
+  assert.match(skeleton, /export default function render\(\)/);
+  assert.doesNotMatch(skeleton, /ignored|<Component|<b>/);
+  const anchor = formatWithHashlines(source).lines[4];
+  assert.ok(skeleton.includes(`L5#${anchor.hash}:`));
+});
+
+test('malformed TS and unsupported languages retain full anchored source', () => {
+  const malformed = 'export const x = (\nconst unrelated = 3;';
+  assert.equal(extractAstSkeleton(malformed, 'typescript', 'bad.ts'), formatWithHashlines(malformed).formatted);
+  const unknown = 'opaque content without recognizable symbols';
+  assert.equal(extractAstSkeleton(unknown, 'go', 'unrecognized.go'), formatWithHashlines(unknown).formatted);
+});

@@ -231,18 +231,16 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
         <div className="flex flex-wrap items-center justify-between gap-2 font-semibold">
           <span>
             Достоверность активного отчёта:{' '}
-            {provenance === 'measured' && manifest.provider === 'ollama'
-              ? `MEASURED · Локальная Ollama + ${manifest.isolationMode === 'snapshot_copy' ? 'Snapshot Copy (без .git)' : 'Git Worktree'} (без API-ключа)`
+            {(provenance === 'measured' || provenance === 'measured_local') && manifest.provider === 'ollama'
+              ? `MEASURED_LOCAL · Локальная Ollama + ${manifest.isolationMode === 'snapshot_copy' ? 'Snapshot Copy' : 'Git Worktree'} (без API-ключа)`
               : provenance === 'measured' && manifest.isolationMode === 'snapshot_copy'
-              ? 'MEASURED · API + Snapshot Copy (без .git)'
+              ? 'MEASURED · API + Snapshot Copy'
               : PROVENANCE_LABEL[provenance]}
           </span>
           <span className="font-mono text-slate-700">
             provider: {manifest.provider} · runId: {manifest.runId} ·{' '}
             {manifest.isolationMode === 'snapshot_copy' ? 'snapshot' : 'commit'}:{' '}
-            {manifest.baseCommit.length > 16
-              ? manifest.baseCommit.slice(0, 14)
-              : manifest.baseCommit}
+            {(manifest.snapshotHash ?? manifest.baseCommit ?? '—').slice(0, 14)}
           </span>
         </div>
         {limitations.length > 0 && (
@@ -791,9 +789,7 @@ export const OverviewBenchmarkView: React.FC<OverviewBenchmarkViewProps> = ({
                     {manifest.isolationMode === 'snapshot_copy' ? 'Snapshot SHA-256' : 'Base Commit'}
                   </dt>
                   <dd className="font-mono text-slate-900">
-                    {manifest.baseCommit.length > 16
-                      ? manifest.baseCommit.slice(0, 14)
-                      : manifest.baseCommit}
+                    {(manifest.snapshotHash ?? manifest.baseCommit ?? '—').slice(0, 14)}
                   </dd>
                 </div>
                 <div className="py-2 flex justify-between gap-2">

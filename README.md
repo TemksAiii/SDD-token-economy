@@ -10,10 +10,10 @@
 
 | Режим | Что выполняется | Нужен ли LLM / API-ключ | Provenance |
 | --- | --- | --- | --- |
-| **Инспекция OpenSpec, Spec Slicer, AST-LOD & Hashline, Zero-Token Gate, Портативность** | Чтение реальных файлов в `benchmarks/*`, построение AST-скелетов, запуск реальных тестов (`tsx --test`, `tsc --noEmit`, `python3 -m unittest`) и `git` | **Нет** | `measured_local` |
+| **Инспекция OpenSpec, Spec Slicer, AST-LOD & Hashline, Zero-Token Gate, Портативность** | Чтение реальных файлов в `benchmarks/*`, построение AST-скелетов, запуск реальных тестов (`node --import tsx --test`, `tsc --noEmit`, `python3 -m unittest`) и `git` | **Нет** | `measured_local` |
 | **Математическая симуляция и Ablation Study** | Расчётная модель $O(N^2) \to O(N)$ по настраиваемым параметрам (K задач, R ревью, тумблеры модулей) | **Нет** | `simulated` |
-| **Реальный A/B worktree-прогон с облачным флагманом Gemini** | Два изолированных `git worktree` от одного commit SHA, Baseline vs SpecTrim на **Gemini Hydrogen** (`gemini-4-hydrogen`), реальный `usageMetadata` | Нужен `GEMINI_API_KEY` | `measured` |
-| **Реальный A/B worktree-прогон локально через Ollama** | Два изолированных `git worktree` от одного commit SHA, Baseline vs SpecTrim на локальной модели (например `qwen2.5-coder:7b`), счётчики `prompt_eval_count` / `eval_count` | **API-ключ не нужен** (нужна локальная Ollama) | `measured` |
+| **Реальный A/B worktree-прогон с облачным флагманом Gemini** | Два изолированных каталога от одного Git SHA или проверенного снимка, Baseline vs SpecTrim на **Gemini Hydrogen** (`gemini-4-hydrogen`), реальный `usageMetadata` | Нужен `GEMINI_API_KEY` | `measured` |
+| **Реальный A/B worktree-прогон локально через Ollama** | Два изолированных каталога от одного Git SHA или проверенного снимка, Baseline vs SpecTrim на локальной модели (например `qwen2.5-coder:7b`), счётчики `prompt_eval_count` / `eval_count` | **API-ключ не нужен** (нужна локальная Ollama) | `measured_local` |
 
 ---
 
@@ -191,7 +191,9 @@ npm run spectrim -- bench benchmarks/orders-ts add-idempotency-and-webhooks --pr
 ```
 
 Артефакты каждого реального прогона сохраняются на диск в `.spectrim-runs/<runId>/`:
-- `run_manifest.json` — `baseCommit`, провайдер, единая модель, команды тестов/линтера, пути worktree
+- `run_manifest.json` — Git SHA или SHA-256 снимка, провайдер, модель, команды и пути изолированных каталогов
+- `checks.jsonl` — полные выводы проверок с кодами выхода A/B
+- `provider-attempts.jsonl` — обращения к провайдеру, включая повторы
 - `metrics.jsonl` — построчная телеметрия каждого вызова LLM с `provenance`
 - `baseline.diff` и `optimized.diff` — реальные `git diff` из изолированных worktree
 - `summary.json` и `REPORT.md` — сводная таблица Before/After и результаты проверок качества
@@ -220,7 +222,7 @@ npm run build
 
 Тесты находятся в `src/engine/*.test.ts` и `src/runtime/*.test.ts` и проверяют:
 - `specSlicer`, `astLodHashline` (TypeScript, Python, Go, Java), `outputCompressor`, `preReviewGate`, `portability`, `abModelSimulation`;
-- `pathGuard`, `repoFs` (реальные полигоны в `benchmarks/`), `localGateRunner` (реальный запуск `tsx --test`, `tsc --noEmit` и `python3 -m unittest`);
+- `pathGuard`, `repoFs` (реальные полигоны в `benchmarks/`), `localGateRunner` (реальный запуск `node --import tsx --test`, `tsc --noEmit` и `python3 -m unittest`);
 - `llmProvider` (проверка схем URL, discovery `/api/tags`, разбор `prompt_eval_count`/`eval_count` в `/api/chat`, обработка 404, отказ от фабрикации отсутствующих счётчиков, корректный отказ при недоступном сервере).
 
 ---
@@ -280,7 +282,7 @@ npm run build
 
 В интерфейсе, JSON-отчётах и `REPORT.md` данные строго разделяются:
 - **`measured` (облачный API, например `gemini-4-hydrogen`)**: реальные worktree + реальный `usageMetadata` API + реальные тесты и `git diff`.
-- **`measured` (локальная `ollama`)**: реальные worktree + реальные `prompt_eval_count`/`eval_count` локального сервера + реальные тесты и `git diff`. **Важные ограничения локальных моделей Ollama**:
+- **`measured_local` (локальная `ollama`)**: реальные worktree + реальные `prompt_eval_count`/`eval_count` локального сервера + реальные тесты и `git diff`. **Важные ограничения локальных моделей Ollama**:
   1. `costUsd` всегда равен `n/a` (локальный инференс не имеет тарифа облачного API).
   2. `cacheUsageMeasured` равен `false` (`cachedInputTokens = 0`), так как Ollama `/api/chat` не отдаёт счётчик кэшированных токенов.
   3. Компактные локальные модели (например 7B–8B) могут чаще допускать ошибки формата JSON или недописывать `@spec:REQ-XX` — SpecTrim честно отразит это в `retries`, `testsPassed`, `lintPassed` и `reqCoveragePct` без подделки зелёных галочек. Для эталонного сравнения на жюри используйте облачный флагман `gemini-4-hydrogen`.
