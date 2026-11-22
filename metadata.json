@@ -1,6 +1,0 @@
-{
-  "name": "SpecTrim SDD Workbench",
-  "description": "Интерактивный инженерный стенд и прототип оптимизации токенов для Spec-Driven Development (OpenCode + OpenSpec): Spec Slicer, AST-LOD & Hashline, Log Compressor, Zero-Token Pre-Review Gate и A/B бенчмарк.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
